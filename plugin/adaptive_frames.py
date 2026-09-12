@@ -457,20 +457,53 @@ ASR_MODE_LOCAL = "local"
 ASR_MODE_API = "api"
 
 
+def available_memory_mb() -> float:
+    """系统当前可用物理内存（MB）。读不到时返回 -1。"""
+    try:
+        import ctypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+        stat = MEMORYSTATUSEX()
+        stat.dwLength = ctypes.sizeof(stat)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+            return -1.0
+        return stat.ullAvailPhys / 1048576.0
+    except Exception:
+        return -1.0
+
+
+def unload_local_recognizer() -> None:
+    """卸载本地识别器，尽量释放内存。"""
+    _LOCAL_ASR_CACHE.clear()
+    import gc
+    gc.collect()
+
+
 def audio_transcript(video: Path, *, out_dir: Path, mode: str = ASR_MODE_OFF,
                      api_key: str = "", local_model=None, local_tokens=None,
                      num_threads: int = 2, noise_db: float = -30.0,
                      min_silence: float = 0.5, min_speech_ratio: float = 0.02,
                      min_core_chars: int = 4, timeout: float = 30.0,
-                     model: str = DEFAULT_ASR_MODEL) -> dict:
+                     model: str = DEFAULT_ASR_MODEL, min_free_mb: float = 500.0,
+                     fallback: bool = True, unload_after: bool = True) -> dict:
     """完整音频链路：抽轨 → 静音分析 → 去静音 → 转录。
 
-    mode（启动优先级）：
-      off(1)   不读音频，直接跳过（默认）
-      local(2) 本地 sherpa-onnx SenseVoice，需 local_model / local_tokens
-      api(3)   云端 ASR，需 api_key，超时则降级
+    mode（首选途径）：
+      off(1)   不读音频（默认）
+      local(2) 本地 sherpa-onnx SenseVoice
+      api(3)   云端 ASR
 
-    返回 dict：mode / has_audio / speech_ratio / text / skipped / reason。
+    fallback=True 时，首选失败会回退到另一种途径；本地途径在加载前
+    先查可用内存，低于 min_free_mb 则跳过（不达标就不加载模型）。
     """
     if mode == ASR_MODE_OFF:
         return {"mode": mode, "skipped": True, "reason": "disabled", "text": ""}
@@ -489,27 +522,53 @@ def audio_transcript(video: Path, *, out_dir: Path, mode: str = ASR_MODE_OFF,
 
     lean = strip_silence(wav, out_dir / (video.stem + ".lean.wav"),
                          noise_db, min_silence)
-    try:
-        if mode == ASR_MODE_LOCAL:
-            if not local_model or not local_tokens:
-                raise RuntimeError("未提供本地模型路径")
-            text = transcribe_local(lean, model=Path(local_model),
-                                    tokens=Path(local_tokens),
-                                    num_threads=num_threads)
-        else:
+
+    order = [mode]
+    if fallback:
+        order.append(ASR_MODE_LOCAL if mode == ASR_MODE_API else ASR_MODE_API)
+
+    tried: list[str] = []
+    text = ""
+    used = ""
+    for approach in order:
+        try:
+            if approach == ASR_MODE_LOCAL:
+                if not (local_model and local_tokens):
+                    tried.append("local:未配置模型")
+                    continue
+                free = available_memory_mb()
+                if 0 <= free < min_free_mb:
+                    tried.append(f"local:内存不足({free:.0f}MB<{min_free_mb:.0f}MB)")
+                    continue
+                text = transcribe_local(lean, model=Path(local_model),
+                                        tokens=Path(local_tokens),
+                                        num_threads=num_threads)
+                used = "local"
+                break
+            if not api_key:
+                tried.append("api:未配置 Key")
+                continue
             text = transcribe_audio(lean, api_key=api_key, model=model,
                                     timeout=timeout)
-    except Exception as e:  # 超时或上游异常：降级，不阻塞
+            used = "api"
+            break
+        except Exception as exc:  # noqa: BLE001
+            tried.append(f"{approach}:{type(exc).__name__}")
+        finally:
+            if unload_after:
+                unload_local_recognizer()
+
+    if not used:
         return {"mode": mode, "has_audio": True, "speech_ratio": ratio,
-                "skipped": True, "reason": "asr_failed",
-                "error": type(e).__name__, "text": ""}
+                "skipped": True, "reason": "asr_failed", "tried": tried, "text": ""}
 
     core = transcript_core(text)
     if len(core) < min_core_chars:
-        return {"mode": mode, "has_audio": True, "speech_ratio": ratio,
-                "skipped": True, "reason": "no_speech_content", "text": text}
-    return {"mode": mode, "has_audio": True, "speech_ratio": ratio,
-            "skipped": False, "duration": dur, "text": text}
+        return {"mode": mode, "used": used, "has_audio": True,
+                "speech_ratio": ratio, "skipped": True,
+                "reason": "no_speech_content", "text": text}
+    return {"mode": mode, "used": used, "has_audio": True,
+            "speech_ratio": ratio, "skipped": False, "duration": dur, "text": text}
 
 
 # ---------------- 本地 ASR（可选，无网络） ----------------
@@ -584,20 +643,24 @@ DS_CHAT_URL = "https://api.deepseek.com/chat/completions"
 DEFAULT_VISION_MODEL = "deepseek-flash"
 
 
+def build_vision_prompt(transcript: str = "", max_chars: int = 8000) -> str:
+    """组装视觉模型的提问文本（插件与直调共用）。"""
+    if transcript:
+        return ("这是从一段视频中按时间顺序抽取的关键帧。视频里的语音转录如下：\n"
+                + transcript[:max_chars] +
+                "\n\n请综合画面和语音，用一段话概括这段视频的内容，200 字以内。"
+                "以画面为主要依据，只写能从画面和语音中确认的内容，"
+                "不要推测，也不要解释判断过程。")
+    return ("这是从一段视频中按时间顺序抽取的关键帧。"
+            "请用一段话概括这段视频的内容，200 字以内。"
+            "只写能从画面中确认的内容，不要推测。")
+
+
 def describe_video(frames, transcript: str = "", *, api_key: str,
                    url: str = DS_CHAT_URL, model: str = DEFAULT_VISION_MODEL,
                    timeout: float = 120.0, max_chars: int = 8000) -> str:
     """把关键帧（可选带语音转录）交给视觉模型，返回描述。"""
-    if transcript:
-        prompt = ("这是从一段视频中按时间顺序抽取的关键帧。视频里的语音转录如下：\n"
-                  + transcript[:max_chars] +
-                  "\n\n请综合画面和语音，用一段话概括这段视频的内容，200 字以内。"
-                  "以画面为主要依据，只写能从画面和语音中确认的内容，"
-                  "不要推测，也不要解释判断过程。")
-    else:
-        prompt = ("这是从一段视频中按时间顺序抽取的关键帧。"
-                  "请用一段话概括这段视频的内容，200 字以内。"
-                  "只写能从画面中确认的内容，不要推测。")
+    prompt = build_vision_prompt(transcript, max_chars)
     content = [{"type": "text", "text": prompt}]
     for f in frames:
         b = base64.b64encode(Path(f).read_bytes()).decode("ascii")

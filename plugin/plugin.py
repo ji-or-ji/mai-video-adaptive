@@ -81,6 +81,14 @@ class AudioSection(PluginConfigBase):
                               json_schema_extra={"label": "本地词表路径", "order": 60})
     timeout_s: float = Field(default=30.0, description="云端转录超时，超时即降级只交帧",
                              json_schema_extra={"label": "转录超时（秒）", "order": 70})
+    min_free_mb: float = Field(
+        default=500.0,
+        description="加载本地模型前要求的最小可用内存（MB）；不达标就不加载",
+        json_schema_extra={"label": "本地模式内存门槛（MB）", "order": 80})
+    fallback: bool = Field(default=True, description="首选途径失败时回退另一种（API↔本地）",
+                           json_schema_extra={"label": "失败回退", "order": 90})
+    unload_after: bool = Field(default=True, description="转录后卸载本地模型，释放内存",
+                               json_schema_extra={"label": "用完卸载", "order": 100})
 
 
 class VisionSection(PluginConfigBase):
@@ -394,7 +402,10 @@ class VideoUnderstandPlugin(MaiBotPlugin):
             local_model=cfg.audio.local_model or None,
             local_tokens=cfg.audio.local_tokens or None,
             model=str(cfg.audio.api_model or af.DEFAULT_ASR_MODEL),
-            timeout=float(cfg.audio.timeout_s))
+            timeout=float(cfg.audio.timeout_s),
+            min_free_mb=float(cfg.audio.min_free_mb),
+            fallback=bool(cfg.audio.fallback),
+            unload_after=bool(cfg.audio.unload_after))
         transcript = "" if audio.get("skipped") else str(audio.get("text") or "")
 
         return {"cached": False, "frames": frames, "transcript": transcript,

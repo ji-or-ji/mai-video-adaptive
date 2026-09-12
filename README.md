@@ -57,7 +57,14 @@ sherpa-onnx 的 SenseVoice（int8，约 228MB）：
 |---|---|---|
 | 不用 | `off` | **默认**，不读音频 |
 | 本地 | `local` | sherpa-onnx SenseVoice，无网络、不外传 |
-| API | `api` | 云端 ASR，带超时降级（超时即只交帧） |
+| API | `api` | 云端 ASR，带超时降级 |
+
+**失败回退**：首选途径失败时自动换另一种（api ↔ local），两条都失败才放弃。
+
+**内存闸门**：走本地模式前先查可用内存，低于 `min_free_mb`（默认 500MB）就不加载模型。
+这样内存吃紧的机器即使配置了本地模式，也不会把宿主挤崩。
+
+**用完即卸**：转录完立即释放本地模型（`unload_after`），避免常驻占内存。
 
 ## 参数
 
@@ -70,6 +77,9 @@ sherpa-onnx 的 SenseVoice（int8，约 228MB）：
 | `bucket_s` | 0.5 | 密度曲线分桶粒度 |
 | `max_height` | 720 | 抽帧后的最大高度 |
 | `match_threshold` | 0.9 | 签名命中阈值 |
+| `min_free_mb` | 500 | 本地模型内存门槛 |
+| `fallback` | true | 首选途径失败时回退另一种 |
+| `unload_after` | true | 转录后卸载本地模型 |
 
 ## 实测数据
 
