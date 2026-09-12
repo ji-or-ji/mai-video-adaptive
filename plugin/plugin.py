@@ -42,12 +42,22 @@ class PluginSection(PluginConfigBase):
 
     enabled: bool = Field(default=True, description="插件总开关",
                           json_schema_extra={"label": "启用插件", "order": 10})
+    config_version: str = Field(default="1.0.0", description="配置版本（版本策略要求，一般无需改）",
+                                json_schema_extra={"label": "配置版本", "order": 20})
 
 
 class ExtractSection(PluginConfigBase):
     __ui_label__ = "抽帧"
     __ui_order__ = 1
 
+    ffmpeg_path: str = Field(
+        default="",
+        description="ffmpeg 可执行文件绝对路径；留空则用 PATH（麦麦进程可能读不到新 PATH）",
+        json_schema_extra={"label": "ffmpeg 路径", "order": 5})
+    ffprobe_path: str = Field(
+        default="",
+        description="ffprobe 可执行文件绝对路径；留空则用 PATH",
+        json_schema_extra={"label": "ffprobe 路径", "order": 6})
     seconds_per_frame: float = Field(
         default=4.0, description="有效内容的取样密度：每几秒一帧",
         json_schema_extra={"label": "每几秒一帧", "order": 10})
@@ -95,9 +105,20 @@ class VisionSection(PluginConfigBase):
     __ui_label__ = "视觉模型"
     __ui_order__ = 3
 
+    mode: str = Field(
+        default="host", description="host=走主程序任务 / direct=直连接口",
+        json_schema_extra={"label": "调用方式（host/direct）", "order": 10})
     host_task: str = Field(
-        default="vlm", description="走主程序的任务名；把该任务指向支持图片输入的模型",
-        json_schema_extra={"label": "模型任务名", "order": 10})
+        default="vlm", description="host 模式走的任务名",
+        json_schema_extra={"label": "主程序任务名", "order": 20})
+    api_url: str = Field(default=af.DS_CHAT_URL, description="direct 模式的接口地址",
+                         json_schema_extra={"label": "接口地址", "order": 30})
+    api_key: str = Field(default="", description="direct 模式的 API Key",
+                         json_schema_extra={"label": "API Key", "order": 40})
+    model: str = Field(default=af.DEFAULT_VISION_MODEL, description="direct 模式的模型名",
+                       json_schema_extra={"label": "模型名", "order": 50})
+    timeout_s: float = Field(default=120.0, description="direct 模式超时",
+                             json_schema_extra={"label": "超时（秒）", "order": 60})
 
 
 class CacheSection(PluginConfigBase):
@@ -123,6 +144,12 @@ class NapcatSection(PluginConfigBase):
                                json_schema_extra={"label": "HTTP Base URL", "order": 20})
     access_token: str = Field(default="", description="可选 access token",
                               json_schema_extra={"label": "Access Token", "order": 30})
+    fetch_dir: str = Field(
+        default="",
+        description="NapCat 取回插件（video-fetch）的下载目录；填了则优先从这里取视频",
+        json_schema_extra={"label": "取回目录", "order": 40})
+    fetch_wait_s: float = Field(default=60.0, description="等待取回目录出现文件的最长秒数",
+                                json_schema_extra={"label": "等待秒数", "order": 50})
 
 
 class SourceSection(PluginConfigBase):
@@ -171,12 +198,17 @@ class VideoUnderstandPlugin(MaiBotPlugin):
     async def on_load(self) -> None:
         self._sem = asyncio.Semaphore(max(1, int(self.config.source.concurrency)))
         Path(self.ctx.paths.runtime_dir).mkdir(parents=True, exist_ok=True)
+        # 指定 ffmpeg / ffprobe（进程继承的 PATH 可能不含它们）
+        ff = str(self.config.extract.ffmpeg_path or "").strip()
+        fp = str(self.config.extract.ffprobe_path or "").strip()
+        af.set_tools(ff or None, fp or None)
+        import shutil as _sh
         self.ctx.logger.info(
-            "视频理解插件已加载 extract=%s/s audio=%s cache=%s",
+            "视频理解插件已加载 extract=%s/s audio=%s cache=%s ffmpeg=%s",
             self.config.extract.seconds_per_frame,
             self.config.audio.mode,
             self.config.cache.enabled,
-        )
+            af.FFMPEG if not ff else ff)
 
     async def on_unload(self) -> None:
         for task in list(self._bg):
@@ -283,17 +315,27 @@ class VideoUnderstandPlugin(MaiBotPlugin):
                 self.ctx.logger.info("视频理解完成 name=%s text=%s",
                                      asset.name or asset.file_ref, text[:80])
             except Exception as exc:  # noqa: BLE001
-                self.ctx.logger.warning("视频理解失败 name=%s err=%s",
-                                        asset.name or asset.file_ref, exc)
+                import traceback
+                self.ctx.logger.warning("视频理解失败 name=%s err=%s\n%s",
+                                        asset.name or asset.file_ref, exc,
+                                        traceback.format_exc()[-800:])
 
     async def _materialize(self, asset: media_mod.VideoAsset) -> Path:
-        """落盘；只有文件名时经 NapCat 取回。"""
+        """落盘；优先用 NapCat 取回插件的下载目录，其次直取，最后 NapCat get_file。"""
 
         cfg = self.config
         runtime = Path(self.ctx.paths.runtime_dir) / "videos" / asset.key[:16]
         max_bytes = int(float(cfg.source.max_video_mb) * 1024 * 1024)
         timeout_s = max(5.0, float(cfg.audio.timeout_s))
 
+        # 1) NapCat 取回插件的下载目录（video-fetch 插件把真实视频存这里）
+        fetch_dir = str(cfg.napcat.fetch_dir or "").strip()
+        if fetch_dir:
+            got = await self._wait_fetched(fetch_dir, asset)
+            if got is not None and got.stat().st_size <= max_bytes:
+                return got
+
+        # 2) 自带来源（url / base64 / 本地路径）
         if asset.url or asset.base64_data or asset.local_path:
             try:
                 return await media_mod.materialize(
@@ -303,6 +345,7 @@ class VideoUnderstandPlugin(MaiBotPlugin):
                     raise
                 self.ctx.logger.info("直接落盘失败，尝试 NapCat：%s", exc)
 
+        # 3) NapCat OneBot get_file
         ref = str(asset.file_ref or asset.name or "").strip()
         if not ref:
             raise ValueError("素材缺少 url / base64 / local_path / file_ref")
@@ -312,6 +355,35 @@ class VideoUnderstandPlugin(MaiBotPlugin):
         name = asset.name or ref
         return await asyncio.to_thread(
             media_mod.save_bytes, raw, target_dir=runtime, name=name, key=asset.key)
+
+    async def _wait_fetched(self, fetch_dir: str, asset: media_mod.VideoAsset) -> Path | None:
+        """等待取回目录里出现目标视频（按 latest.json 的 done 状态或同名文件判定）。"""
+
+        import json as _json
+
+        names = [n for n in (asset.name, asset.file_ref) if n]
+        deadline = time.time() + max(1.0, float(self.config.napcat.fetch_wait_s))
+        dir_path = Path(fetch_dir)
+
+        while time.time() < deadline:
+            # a) 看 latest.json 是否已完成且对得上
+            record = dir_path / "latest.json"
+            if record.is_file():
+                try:
+                    info = _json.loads(record.read_text(encoding="utf-8"))
+                except Exception:
+                    info = {}
+                if str(info.get("phase")) == "done":
+                    saved = str(info.get("saved") or "")
+                    if saved and Path(saved).is_file():
+                        return Path(saved)
+            # b) 直接找同名文件
+            for name in names:
+                cand = dir_path / name
+                if cand.is_file() and cand.stat().st_size > 0:
+                    return cand
+            await asyncio.sleep(2.0)
+        return None
 
     async def _fetch_via_napcat(self, file_ref: str) -> bytes:
         cfg = self.config
@@ -361,12 +433,19 @@ class VideoUnderstandPlugin(MaiBotPlugin):
             data = data["data"]
         if not isinstance(data, dict):
             return b""
+
         b64 = str(data.get("base64") or data.get("base64_data") or "").strip()
         if b64:
             return base64.b64decode(b64.split(",")[-1], validate=False)
-        path = str(data.get("file") or data.get("path") or "").strip()
-        if path and Path(path).is_file():
-            return Path(path).read_bytes()
+
+        # NapCat 常把本地文件路径放在 file / path / url 里（url 未必是网络地址）
+        for key in ("file", "path", "file_path", "url"):
+            cand = str(data.get(key) or "").strip()
+            if not cand or cand.lower().startswith(("http://", "https://")):
+                continue
+            p = Path(cand)
+            if p.is_file():
+                return p.read_bytes()
         return b""
 
     # ---- 同步部分（在线程里跑） ----
@@ -374,6 +453,10 @@ class VideoUnderstandPlugin(MaiBotPlugin):
     def _prepare(self, video: Path) -> dict[str, Any]:
         cfg = self.config
         runtime = Path(self.ctx.paths.runtime_dir) / "videos" / video.stem
+        import shutil as _sh
+        self.ctx.logger.info(
+            "工具检查 ffmpeg=%s ffprobe=%s FFMPEG=%s",
+            _sh.which("ffmpeg"), _sh.which("ffprobe"), af.FFMPEG)
 
         cache = None
         sig = None
@@ -414,6 +497,19 @@ class VideoUnderstandPlugin(MaiBotPlugin):
     # ---- 异步：调用宿主模型 ----
 
     async def _describe(self, frames: list[Path], transcript: str) -> str:
+        cfg = self.config
+        mode = str(cfg.vision.mode or "host").strip().lower()
+
+        if mode == "direct":
+            if not str(cfg.vision.api_key or "").strip():
+                raise RuntimeError("direct 模式未配置 API Key")
+            return await asyncio.to_thread(
+                af.describe_video, frames, transcript,
+                api_key=str(cfg.vision.api_key),
+                url=str(cfg.vision.api_url),
+                model=str(cfg.vision.model),
+                timeout=float(cfg.vision.timeout_s))
+
         prompt = af.build_vision_prompt(transcript)
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         for frame in frames:
@@ -422,7 +518,7 @@ class VideoUnderstandPlugin(MaiBotPlugin):
                             "image_base64": b64})
         result = await self.ctx.llm.generate(
             [{"role": "user", "content": content}],
-            model=str(self.config.vision.host_task or "vlm"))
+            model=str(cfg.vision.host_task or "vlm"))
 
         if isinstance(result, dict):
             if result.get("success") is False:

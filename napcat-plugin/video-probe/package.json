@@ -1,0 +1,9 @@
+{
+  "name": "video-probe",
+  "plugin": "视频探测",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "index.mjs",
+  "description": "探测视频消息结构，验证 fileCode 与 elementId 可获得性",
+  "author": "ji-or-ji"
+}
