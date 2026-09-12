@@ -116,6 +116,11 @@ python tools/cache_e2e_test.py  # 签名缓存
 
 ## 麦麦插件
 
-`plugin/` 是可直接放进麦麦 `plugins/` 的插件。它另需一个配套的 NapCat 插件
-（`napcat-plugin/video-probe/`）——因为 QQ 不下载群视频原片，必须从 NapCat 的
-原始事件里拿真实 CDN 地址并下载。详见 `plugin/README.md`。
+`plugin/` 是可直接放进麦麦 `plugins/` 的插件。
+
+**它有硬前置**：必须同时装一个配套的 NapCat 插件（`napcat-plugin/video-probe/`）。
+因为 QQ 不下载群视频原片、适配器又把下载地址压成了纯文本，必须从 NapCat 的
+原始事件里拿真实 CDN 地址并下载。安装步骤见 `plugin/README.md` 开头的「必装前置」。
+
+插件还带三道内存护栏（内存闸门 / 失败回退 / 用完即卸），让本地音频模式
+在内存吃紧的机器上也能安全启用。

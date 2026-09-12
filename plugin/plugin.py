@@ -274,9 +274,16 @@ class VideoUnderstandPlugin(MaiBotPlugin):
     )
     async def on_before_model_request(self, messages: Any = None,
                                       **kwargs: Any) -> dict[str, Any] | None:
+        """模型请求前注入最近一次视频理解结果。
+
+        注意：这个钩子给的是麦麦自己的 ContextItem 列表（kwargs['items']），
+        不是 OpenAI 风格的 messages。
+        """
         if not self.config.plugin.enabled:
             return None
-        if not isinstance(messages, list):
+
+        items = kwargs.get("items")
+        if not isinstance(items, list):
             return None
 
         sid = str(kwargs.get("session_id") or kwargs.get("stream_id") or "").strip()
@@ -286,20 +293,40 @@ class VideoUnderstandPlugin(MaiBotPlugin):
         if not record or not str(record.get("text") or "").strip():
             return None
 
-        if any(isinstance(m, dict) and isinstance(m.get("content"), str)
-               and _M_DONE in str(m.get("content")) for m in messages):
-            return None
+        text = str(record["text"]).strip()
 
-        block = f"{_M_DONE} {str(record['text']).strip()}"
-        new_messages = list(messages)
-        pos = 0
-        for index, msg in enumerate(messages):
-            if isinstance(msg, dict) and msg.get("role") == "system":
-                pos = index + 1
-            else:
-                break
-        new_messages.insert(pos, {"role": "system", "content": block})
-        return {"action": "continue", "modified_kwargs": {"messages": new_messages}}
+        # 已在上下文里则不重复注入
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            for part in (it.get("parts") or []):
+                if isinstance(part, dict) and _M_DONE in str(part.get("text") or ""):
+                    return None
+
+        import uuid as _uuid
+        from datetime import datetime as _dt
+
+        block = f"{_M_DONE} {text}"
+        item = {
+            "item_type": "SystemMessageItem",
+            "meta": {
+                "item_id": _uuid.uuid4().hex,
+                "logical_turn_id": None,
+                "timestamp": _dt.now().isoformat(),
+            },
+            "parts": [{"type": "text", "text": block}],
+        }
+        new_items = list(items)
+        # 追加到末尾：保持前缀（人设 + 历史）不变，命中 prompt 缓存
+        new_items.append(item)
+        # 整包回传：只替换 items，其余参数（含 item_schema_version）原样带回去
+        new_kwargs = dict(kwargs)
+        new_kwargs["items"] = new_items
+        if not new_kwargs.get("item_schema_version"):
+            new_kwargs["item_schema_version"] = 1
+        self.ctx.logger.info("已注入视频内容（末尾，schema=%s）：%s",
+                             new_kwargs.get("item_schema_version"), block[:120])
+        return {"action": "continue", "modified_kwargs": new_kwargs}
 
     # ---- 处理流水线 ----
 
