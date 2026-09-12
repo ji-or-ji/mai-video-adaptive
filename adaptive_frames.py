@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import base64
 import json
 import math
 import re
@@ -450,41 +451,64 @@ def transcript_core(text: str) -> str:
     return "".join(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]", text))
 
 
-def audio_transcript(video: Path, *, out_dir: Path, api_key: str,
-                     noise_db: float = -30.0, min_silence: float = 0.5,
-                     min_speech_ratio: float = 0.02, min_core_chars: int = 4,
-                     timeout: float = 30.0,
+ASR_MODE_OFF = "off"
+ASR_MODE_LOCAL = "local"
+ASR_MODE_API = "api"
+
+
+def audio_transcript(video: Path, *, out_dir: Path, mode: str = ASR_MODE_OFF,
+                     api_key: str = "", local_model=None, local_tokens=None,
+                     num_threads: int = 2, noise_db: float = -30.0,
+                     min_silence: float = 0.5, min_speech_ratio: float = 0.02,
+                     min_core_chars: int = 4, timeout: float = 30.0,
                      model: str = DEFAULT_ASR_MODEL) -> dict:
     """完整音频链路：抽轨 → 静音分析 → 去静音 → 转录。
 
-    返回 dict：has_audio / speech_ratio / text / skipped / reason。
-    无音轨、几乎全静音、转录无实质内容时 skipped=True。
+    mode（启动优先级）：
+      off(1)   不读音频，直接跳过（默认）
+      local(2) 本地 sherpa-onnx SenseVoice，需 local_model / local_tokens
+      api(3)   云端 ASR，需 api_key，超时则降级
+
+    返回 dict：mode / has_audio / speech_ratio / text / skipped / reason。
     """
+    if mode == ASR_MODE_OFF:
+        return {"mode": mode, "skipped": True, "reason": "disabled", "text": ""}
+
     info = probe_audio(video)
     if not info.get("has_audio"):
-        return {"has_audio": False, "skipped": True, "reason": "no_audio", "text": ""}
+        return {"mode": mode, "has_audio": False, "skipped": True,
+                "reason": "no_audio", "text": ""}
 
     out_dir.mkdir(parents=True, exist_ok=True)
     wav = extract_audio(video, out_dir / (video.stem + ".wav"))
     ratio, _, dur = audio_speech_ratio(wav, noise_db, min_silence)
     if ratio < min_speech_ratio:
-        return {"has_audio": True, "speech_ratio": ratio, "skipped": True,
-                "reason": "silent", "text": ""}
+        return {"mode": mode, "has_audio": True, "speech_ratio": ratio,
+                "skipped": True, "reason": "silent", "text": ""}
 
     lean = strip_silence(wav, out_dir / (video.stem + ".lean.wav"),
                          noise_db, min_silence)
     try:
-        text = transcribe_audio(lean, api_key=api_key, model=model,
-                                timeout=timeout)
+        if mode == ASR_MODE_LOCAL:
+            if not local_model or not local_tokens:
+                raise RuntimeError("未提供本地模型路径")
+            text = transcribe_local(lean, model=Path(local_model),
+                                    tokens=Path(local_tokens),
+                                    num_threads=num_threads)
+        else:
+            text = transcribe_audio(lean, api_key=api_key, model=model,
+                                    timeout=timeout)
     except Exception as e:  # 超时或上游异常：降级，不阻塞
-        return {"has_audio": True, "speech_ratio": ratio, "skipped": True,
-                "reason": "asr_failed", "error": type(e).__name__, "text": ""}
+        return {"mode": mode, "has_audio": True, "speech_ratio": ratio,
+                "skipped": True, "reason": "asr_failed",
+                "error": type(e).__name__, "text": ""}
+
     core = transcript_core(text)
     if len(core) < min_core_chars:
-        return {"has_audio": True, "speech_ratio": ratio, "skipped": True,
-                "reason": "no_speech_content", "text": text}
-    return {"has_audio": True, "speech_ratio": ratio, "skipped": False,
-            "duration": dur, "text": text}
+        return {"mode": mode, "has_audio": True, "speech_ratio": ratio,
+                "skipped": True, "reason": "no_speech_content", "text": text}
+    return {"mode": mode, "has_audio": True, "speech_ratio": ratio,
+            "skipped": False, "duration": dur, "text": text}
 
 
 # ---------------- 本地 ASR（可选，无网络） ----------------
@@ -551,3 +575,60 @@ def ascii_density(centers, dens, times, width: int = 64, rows: int = 10):
         marks[i] = "^"
     lines.append("".join(marks))
     return "\n".join(lines)
+
+
+# ---------------- 端到端：抽帧 + 音频 → 视觉模型理解 ----------------
+
+DS_CHAT_URL = "https://api.deepseek.com/chat/completions"
+DEFAULT_VISION_MODEL = "deepseek-flash"
+
+
+def describe_video(frames, transcript: str = "", *, api_key: str,
+                   url: str = DS_CHAT_URL, model: str = DEFAULT_VISION_MODEL,
+                   timeout: float = 120.0, max_chars: int = 8000) -> str:
+    """把关键帧（可选带语音转录）交给视觉模型，返回描述。"""
+    if transcript:
+        prompt = ("这是从一段视频中按时间顺序抽取的关键帧。视频里还有人说话，"
+                  "语音转录如下：\n" + transcript[:max_chars] +
+                  "\n\n请综合画面和语音，概括这段视频讲了什么，200 字以内。")
+    else:
+        prompt = ("这是从一段视频中按时间顺序抽取的关键帧。"
+                  "请概括这段视频讲了什么，200 字以内。")
+    content = [{"type": "text", "text": prompt}]
+    for f in frames:
+        b = base64.b64encode(Path(f).read_bytes()).decode("ascii")
+        content.append({"type": "image_url",
+                        "image_url": {"url": "data:image/jpeg;base64," + b}})
+    payload = {"model": model, "messages": [{"role": "user", "content": content}],
+               "max_tokens": 500, "thinking": {"type": "disabled"}}
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json",
+                 "Authorization": "Bearer " + api_key})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        body = json.loads(r.read().decode("utf-8"))
+    return str((body.get("choices") or [{}])[0].get("message", {}).get("content") or "")
+
+
+def understand_video(video: Path, *, out_dir: Path, asr_mode: str = ASR_MODE_OFF,
+                     api_key: str = "", local_model=None, local_tokens=None,
+                     vision_api_key: str = "",
+                     vision_model: str = DEFAULT_VISION_MODEL,
+                     vision_url: str = DS_CHAT_URL, min_frames=None,
+                     max_frames=None, max_height: int = 720,
+                     vision_timeout: float = 120.0) -> dict:
+    """完整链路：自适应抽帧 + 音频转录 → 视觉模型理解。"""
+    import time as _time
+    t0 = _time.time()
+    vdir = out_dir / video.stem
+    plan, frames = adaptive_extract(video, vdir / "frames", min_frames=min_frames,
+                                    max_frames=max_frames, max_height=max_height)
+    audio = audio_transcript(video, out_dir=vdir / "audio", mode=asr_mode,
+                             api_key=api_key, local_model=local_model,
+                             local_tokens=local_tokens)
+    transcript = "" if audio.get("skipped") else audio.get("text", "")
+    desc = describe_video(frames, transcript, api_key=vision_api_key,
+                          url=vision_url, model=vision_model, timeout=vision_timeout)
+    return {"frames": len(frames), "novelty": plan.novelty,
+            "frame_count": plan.frame_count, "transcript": transcript,
+            "description": desc, "elapsed": _time.time() - t0}
