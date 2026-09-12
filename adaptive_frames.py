@@ -487,6 +487,49 @@ def audio_transcript(video: Path, *, out_dir: Path, api_key: str,
             "duration": dur, "text": text}
 
 
+# ---------------- 本地 ASR（可选，无网络） ----------------
+
+_LOCAL_ASR_CACHE = {}
+
+
+def _read_wav_mono(path: Path):
+    """读单声道 16bit wav，返回 (采样率, [-1,1] 浮点样本)。"""
+    import wave
+    import array
+    with wave.open(str(path), "rb") as f:
+        if f.getnchannels() != 1:
+            raise ValueError("需要单声道 wav")
+        sr = f.getframerate()
+        raw = f.readframes(f.getnframes())
+    a = array.array("h")
+    a.frombytes(raw)
+    return sr, [s / 32768.0 for s in a]
+
+
+def load_local_recognizer(model: Path, tokens: Path, num_threads: int = 2):
+    """加载并缓存 sherpa-onnx SenseVoice 识别器。"""
+    key = (str(model), str(tokens), num_threads)
+    rec = _LOCAL_ASR_CACHE.get(key)
+    if rec is None:
+        import sherpa_onnx
+        rec = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+            model=str(model), tokens=str(tokens), num_threads=num_threads,
+            use_itn=True, language="auto", debug=False)
+        _LOCAL_ASR_CACHE[key] = rec
+    return rec
+
+
+def transcribe_local(wav: Path, *, model: Path, tokens: Path,
+                     num_threads: int = 2) -> str:
+    """本地 sherpa-onnx SenseVoice 转录（无网络）。"""
+    rec = load_local_recognizer(model, tokens, num_threads)
+    sr, samples = _read_wav_mono(wav)
+    s = rec.create_stream()
+    s.accept_waveform(sr, samples)
+    rec.decode_stream(s)
+    return str(s.result.text or "")
+
+
 # ---------------- 调试可视化 ----------------
 
 def ascii_density(centers, dens, times, width: int = 64, rows: int = 10):
