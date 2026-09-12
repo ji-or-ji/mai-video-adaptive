@@ -158,6 +158,10 @@ class SourceSection(PluginConfigBase):
 
     auto_process: bool = Field(default=True, description="自动处理入站视频",
                                json_schema_extra={"label": "自动处理", "order": 10})
+    cleanup_after: bool = Field(
+        default=True,
+        description="理解完成后删除视频与中间文件（帧/音频）；描述已入缓存，不影响复用",
+        json_schema_extra={"label": "完成后删除文件", "order": 15})
     max_video_mb: float = Field(default=80.0, description="超过该大小跳过",
                                 json_schema_extra={"label": "最大体积（MB）", "order": 20})
     max_videos_per_message: int = Field(default=3, description="单条消息最多处理几个视频",
@@ -301,10 +305,11 @@ class VideoUnderstandPlugin(MaiBotPlugin):
 
     async def _handle(self, asset: media_mod.VideoAsset, stream_id: str) -> None:
         assert self._sem is not None
+        video_path: Path | None = None
         async with self._sem:
             try:
-                video = await self._materialize(asset)
-                prep = await asyncio.to_thread(self._prepare, video)
+                video_path = await self._materialize(asset)
+                prep = await asyncio.to_thread(self._prepare, video_path)
                 if prep.get("cached"):
                     text = prep["text"]
                 else:
@@ -319,6 +324,49 @@ class VideoUnderstandPlugin(MaiBotPlugin):
                 self.ctx.logger.warning("视频理解失败 name=%s err=%s\n%s",
                                         asset.name or asset.file_ref, exc,
                                         traceback.format_exc()[-800:])
+            finally:
+                if bool(self.config.source.cleanup_after):
+                    await asyncio.to_thread(self._cleanup, asset, video_path)
+
+    def _cleanup(self, asset: media_mod.VideoAsset, video_path: Path | None) -> None:
+        """清理视频本体与中间产物（帧 / 音频）。描述已入签名缓存，删除不影响复用。"""
+
+        import shutil as _sh
+        removed = []
+
+        # 1) 取回的视频本体（可能在 NapCat 下载目录，也可能在本地运行时目录）
+        cands = []
+        if video_path is not None:
+            cands.append(Path(video_path))
+        fetch_dir = str(self.config.napcat.fetch_dir or "").strip()
+        if fetch_dir:
+            for name in (asset.name, asset.file_ref):
+                if name:
+                    cands.append(Path(fetch_dir) / name)
+        for p in cands:
+            try:
+                if p.is_file():
+                    p.unlink()
+                    removed.append(str(p))
+            except Exception as exc:  # noqa: BLE001
+                self.ctx.logger.warning("删除视频失败 %s: %s", p, exc)
+
+        # 2) 中间产物目录（frame/audio/孪生副本）
+        base = Path(self.ctx.paths.runtime_dir) / "videos"
+        targets = []
+        if video_path is not None:
+            targets.append(base / Path(video_path).stem)
+        targets.append(base / asset.key[:16])
+        for target in targets:
+            try:
+                if target.is_dir():
+                    _sh.rmtree(target, ignore_errors=True)
+                    removed.append(str(target))
+            except Exception:  # noqa: BLE001
+                pass
+
+        if removed:
+            self.ctx.logger.info("已清理视频文件 %d 项", len(removed))
 
     async def _materialize(self, asset: media_mod.VideoAsset) -> Path:
         """落盘；优先用 NapCat 取回插件的下载目录，其次直取，最后 NapCat get_file。"""
