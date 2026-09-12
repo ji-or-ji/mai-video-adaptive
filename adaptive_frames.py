@@ -20,6 +20,7 @@ import json
 import math
 import re
 import subprocess
+import time
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -619,10 +620,26 @@ def understand_video(video: Path, *, out_dir: Path, asr_mode: str = ASR_MODE_OFF
                      vision_model: str = DEFAULT_VISION_MODEL,
                      vision_url: str = DS_CHAT_URL, min_frames=None,
                      max_frames=None, max_height: int = 720,
-                     vision_timeout: float = 120.0) -> dict:
-    """完整链路：自适应抽帧 + 音频转录 → 视觉模型理解。"""
-    import time as _time
-    t0 = _time.time()
+                     vision_timeout: float = 120.0, cache_path=None,
+                     use_cache: bool = True,
+                     match_threshold: float = 0.9) -> dict:
+    """完整链路：签名查重 → 自适应抽帧 + 音频转录 → 视觉模型理解。
+
+    use_cache 且提供 cache_path 时，先查签名缓存；命中则直接复用旧描述，
+    跳过抽帧、音频与模型调用。
+    """
+    t0 = time.time()
+    cache, sig = None, None
+    if use_cache and cache_path:
+        cache = VideoSignatureCache(cache_path, match_threshold=match_threshold)
+        info = probe_media(video)
+        sig = cache.signature(video, info["duration"])
+        hit = cache.lookup(sig)
+        if hit:
+            return {"cached": True, "description": hit["text"],
+                    "similarity": hit["similarity"], "source": hit["source"],
+                    "elapsed": time.time() - t0}
+
     vdir = out_dir / video.stem
     plan, frames = adaptive_extract(video, vdir / "frames", min_frames=min_frames,
                                     max_frames=max_frames, max_height=max_height)
@@ -632,6 +649,80 @@ def understand_video(video: Path, *, out_dir: Path, asr_mode: str = ASR_MODE_OFF
     transcript = "" if audio.get("skipped") else audio.get("text", "")
     desc = describe_video(frames, transcript, api_key=vision_api_key,
                           url=vision_url, model=vision_model, timeout=vision_timeout)
-    return {"frames": len(frames), "novelty": plan.novelty,
+    if cache is not None and sig is not None and desc:
+        cache.remember(sig, desc, video.name)
+    return {"cached": False, "frames": len(frames), "novelty": plan.novelty,
             "frame_count": plan.frame_count, "transcript": transcript,
-            "description": desc, "elapsed": _time.time() - t0}
+            "description": desc, "elapsed": time.time() - t0}
+
+
+# ---------------- 签名缓存（相似视频复用描述） ----------------
+
+def _round_fp(fp: dict, nd: int = 3) -> dict:
+    """指纹浮点量化，减小缓存存储体积。"""
+    return {"gray": [round(x, nd) for x in fp["gray"]],
+            "hist": [round(x, nd) for x in fp["hist"]]}
+
+
+class VideoSignatureCache:
+    """按视频签名做相似度去重。
+
+    内容相近的视频（同一视频的不同压缩版本、不同来源的同一段）
+    可复用已有描述，跳过抽帧与模型调用。
+    签名 = 一组探针帧指纹；两个签名相似度 = A 的帧有多少能在 B 里
+    找到高相似匹配。
+    """
+
+    def __init__(self, store: Path, match_threshold: float = 0.9,
+                 max_entries: int = 200, samples: int = 16, px: int = 8,
+                 frame_threshold: float = 0.98):
+        self.store = Path(store)
+        self.match_threshold = match_threshold
+        self.max_entries = max_entries
+        self.samples = samples
+        self.px = px
+        self.frame_threshold = frame_threshold
+        self.entries = self._load()
+
+    def _load(self):
+        if self.store.exists():
+            try:
+                return json.loads(self.store.read_text(encoding="utf-8"))
+            except Exception:
+                return []
+        return []
+
+    def _save(self):
+        self.store.parent.mkdir(parents=True, exist_ok=True)
+        self.store.write_text(json.dumps(self.entries, ensure_ascii=False),
+                              encoding="utf-8")
+
+    def signature(self, video: Path, duration: float):
+        raws = probe_thumbnails(video, duration, self.samples, self.px)
+        return [_round_fp(fingerprint(r)) for r in raws]
+
+    def _ratio(self, sig_a, sig_b):
+        if not sig_a or not sig_b:
+            return 0.0
+        hit = sum(1 for a in sig_a
+                  if max(fp_similarity(a, b) for b in sig_b) >= self.frame_threshold)
+        return hit / len(sig_a)
+
+    def lookup(self, sig):
+        """命中则返回 dict（含 text / similarity），否则 None。"""
+        best, best_sim = None, 0.0
+        for e in self.entries:
+            sim = self._ratio(sig, e.get("sig") or [])
+            if sim > best_sim:
+                best, best_sim = e, sim
+        if best is not None and best_sim >= self.match_threshold:
+            return {"text": best.get("text", ""), "similarity": best_sim,
+                    "source": best.get("source", "")}
+        return None
+
+    def remember(self, sig, text: str, source: str = ""):
+        self.entries.append({"sig": sig, "text": text, "source": source,
+                             "ts": time.time()})
+        if len(self.entries) > self.max_entries:
+            self.entries = self.entries[-self.max_entries:]
+        self._save()
