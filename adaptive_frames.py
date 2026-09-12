@@ -115,7 +115,7 @@ def smooth(dens, win: int = 3):
 # ---------------- 帧数决策 ----------------
 
 def decide_frame_count(duration: float, min_frames: int, max_frames: int,
-                       seconds_per_frame: float = 5.0) -> int:
+                       seconds_per_frame: float = 4.0) -> int:
     """时长决定基础帧数，再夹进上下限。"""
     base = int(round(duration / max(0.5, seconds_per_frame)))
     return int(max(min_frames, min(max_frames, base)))
@@ -172,6 +172,102 @@ def extract_at(video: Path, times, out_dir: Path,
     return paths
 
 
+# ---------------- 探针指纹与新颖率 ----------------
+
+def probe_thumbnails(video: Path, duration: float, samples: int = 32,
+                     px: int = 8):
+    """一次 ffmpeg 调用抽出 samples 张 px*px 的 RGB 原始图。
+
+    均匀采样，用于估算「画面新颖率」。本地抽帧，零 API 成本。
+    """
+    rate = max(1e-6, samples / max(0.1, duration))
+    cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-i", str(video),
+           "-vf", f"fps={rate:.6f},scale={px}:{px}:flags=bilinear",
+           "-frames:v", str(max(1, samples)),
+           "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+    p = subprocess.run(cmd, capture_output=True, timeout=300)
+    fb = px * px * 3
+    data = p.stdout
+    return [data[i:i + fb] for i in range(0, len(data) - fb + 1, fb)]
+
+
+def fingerprint(raw: bytes, bins: int = 16) -> dict:
+    """RGB 原始图 -> 指纹：灰度看构图，直方图看色彩分布。"""
+    gray = []
+    for i in range(0, len(raw) - 2, 3):
+        gray.append(0.299 * raw[i] + 0.587 * raw[i + 1] + 0.114 * raw[i + 2])
+    hist = [0.0] * (3 * bins)
+    n = len(raw) // 3
+    if n:
+        for i in range(0, len(raw) - 2, 3):
+            for c in range(3):
+                hist[c * bins + min(bins - 1, raw[i + c] * bins // 256)] += 1
+        hist = [x / n for x in hist]
+    return {"gray": gray, "hist": hist}
+
+
+def _cos(a, b) -> float:
+    num = sum(x * y for x, y in zip(a, b))
+    da = math.sqrt(sum(x * x for x in a))
+    db = math.sqrt(sum(y * y for y in b))
+    return num / (da * db) if da and db else 0.0
+
+
+def fp_similarity(f1: dict, f2: dict, w_gray: float = 0.5,
+                  w_hist: float = 0.5) -> float:
+    """指纹相似度 0~1。"""
+    return w_gray * _cos(f1["gray"], f2["gray"]) + w_hist * _cos(f1["hist"], f2["hist"])
+
+
+def novelty_scan(video: Path, duration: float, samples: int = 32,
+                 px: int = 8, threshold: float = 0.98):
+    """估算内容新颖率。
+
+    做法：把探针帧按时间对半切，看后半段的帧有多少能在前半段找到
+    高度相似的匹配。循环重复的内容（如 5 秒循环播放），后半段几乎
+    全部能被前半覆盖，新颖率趋近 0；内容一路推进的视频则接近 1。
+
+    返回 (新颖率, 重复度, 全部探针指纹)。
+    """
+    raws = probe_thumbnails(video, duration, samples, px)
+    all_fps = [fingerprint(r) for r in raws]
+    n = len(all_fps)
+    if n < 4:
+        return 1.0, 0.0, all_fps
+    half = n // 2
+    front, back = all_fps[:half], all_fps[half:]
+    matched = 0
+    for b in back:
+        if max(fp_similarity(b, f) for f in front) >= threshold:
+            matched += 1
+    repeat = matched / len(back)
+    return 1.0 - repeat, repeat, all_fps
+
+
+def adaptive_plan(duration: float, novelty: float, *,
+                  seconds_per_frame: float = 4.0,
+                  min_floor: int = 3, max_cap: int = 48,
+                  novelty_power: float = 1.5):
+    """由「时长 × 新颖率」推出帧数区间与目标帧数。
+
+    有效内容量 eff = 时长 × 新颖率^power。
+    重复内容（新颖率→0）无论多长，eff 都趋近 0，帧数被压到下限附近；
+    内容丰富（新颖率→1）则随时长增长，最终由 max_cap 封顶。
+
+    返回 (min_frames, max_frames, target)。
+    """
+    ratio = max(0.0, min(1.0, novelty)) ** novelty_power
+    eff = duration * ratio
+    raw = eff / max(0.5, seconds_per_frame)
+
+    lo = max(min_floor, int(round(raw * 0.5)))
+    hi = int(round(raw * 1.4)) if raw > 0 else min_floor + 2
+    hi = min(max_cap, max(lo + 1, hi))
+    lo = min(lo, hi - 1)
+    target = max(lo, min(hi, int(round(raw)) if raw > 0 else lo))
+    return lo, hi, target
+
+
 # ---------------- 规划与主入口 ----------------
 
 @dataclass
@@ -179,32 +275,59 @@ class Plan:
     duration: float
     frame_count: int
     times: list = field(default_factory=list)
+    min_frames: int = 0
+    max_frames: int = 0
+    novelty: float = -1.0
     note: str = ""
 
 
-def plan_frames(video: Path, *, min_frames: int = 8, max_frames: int = 24,
-                bucket_s: float = 0.5, seconds_per_frame: float = 5.0,
-                smooth_win: int = 3) -> Plan:
-    """只做规划，不抽帧。"""
+def plan_frames(video: Path, *, min_frames: int = None, max_frames: int = None,
+                bucket_s: float = 0.5, seconds_per_frame: float = 4.0,
+                smooth_win: int = 3, adaptive: bool = True,
+                novelty_samples: int = 32, novelty_px: int = 8,
+                novelty_threshold: float = 0.97, max_cap: int = 48) -> Plan:
+    """只做规划，不抽帧。
+
+    min_frames / max_frames 为 None 时启用「时长 × 新颖率」自适应区间；
+    显式传入则按传入值固定。
+    """
     info = probe_media(video)
     duration = info["duration"]
     packets = probe_packets(video)
     centers, dens = build_density(packets, duration, bucket_s)
     dens = smooth(dens, smooth_win)
-    n = decide_frame_count(duration, min_frames, max_frames, seconds_per_frame)
+
+    novelty = -1.0
+    if adaptive and min_frames is None and max_frames is None:
+        novelty, _repeat, _allf = novelty_scan(video, duration, novelty_samples,
+                                               novelty_px, novelty_threshold)
+        lo, hi, n = adaptive_plan(duration, novelty,
+                                  seconds_per_frame=seconds_per_frame,
+                                  max_cap=max_cap)
+    else:
+        lo = 8 if min_frames is None else int(min_frames)
+        hi = 24 if max_frames is None else int(max_frames)
+        lo = max(1, min(lo, hi - 1))
+        n = decide_frame_count(duration, lo, hi, seconds_per_frame)
+
     times = pick_times(centers, dens, n, duration)
     return Plan(duration=duration, frame_count=len(times), times=times,
+                min_frames=lo, max_frames=hi, novelty=novelty,
                 note=f"packets={len(packets)} buckets={len(centers)}")
 
 
-def adaptive_extract(video: Path, out_dir: Path, *, min_frames: int = 8,
-                     max_frames: int = 24, bucket_s: float = 0.5,
-                     seconds_per_frame: float = 5.0, smooth_win: int = 3,
-                     max_height: int = 720):
+def adaptive_extract(video: Path, out_dir: Path, *, min_frames: int = None,
+                     max_frames: int = None, bucket_s: float = 0.5,
+                     seconds_per_frame: float = 4.0, smooth_win: int = 3,
+                     max_height: int = 720, adaptive: bool = True,
+                     novelty_samples: int = 32, novelty_threshold: float = 0.97,
+                     max_cap: int = 48):
     """规划 + 抽帧。返回 (Plan, [图片路径])。"""
     plan = plan_frames(video, min_frames=min_frames, max_frames=max_frames,
                        bucket_s=bucket_s, seconds_per_frame=seconds_per_frame,
-                       smooth_win=smooth_win)
+                       smooth_win=smooth_win, adaptive=adaptive,
+                       novelty_samples=novelty_samples,
+                       novelty_threshold=novelty_threshold, max_cap=max_cap)
     frames = extract_at(video, plan.times, out_dir, max_height=max_height)
     return plan, frames
 
