@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import subprocess
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -330,6 +332,159 @@ def adaptive_extract(video: Path, out_dir: Path, *, min_frames: int = None,
                        novelty_threshold=novelty_threshold, max_cap=max_cap)
     frames = extract_at(video, plan.times, out_dir, max_height=max_height)
     return plan, frames
+
+
+# ---------------- 音频轨道 ----------------
+
+SF_ASR_URL = "https://api.siliconflow.cn/v1/audio/transcriptions"
+DEFAULT_ASR_MODEL = "FunAudioLLM/SenseVoiceSmall"
+
+
+def _probe_duration(path: Path) -> float:
+    out = _run([FFPROBE, "-v", "quiet", "-print_format", "json",
+                "-show_format", str(path)])
+    return float((json.loads(out).get("format") or {}).get("duration") or 0.0)
+
+
+def probe_audio(video: Path) -> dict:
+    """探测音轨。无音轨返回 {'has_audio': False}。"""
+    p = subprocess.run(
+        [FFPROBE, "-v", "quiet", "-print_format", "json",
+         "-select_streams", "a:0", "-show_streams", str(video)],
+        capture_output=True, text=True, timeout=60, errors="replace")
+    try:
+        streams = (json.loads(p.stdout or "{}").get("streams")) or []
+    except Exception:
+        streams = []
+    if not streams:
+        return {"has_audio": False}
+    st = streams[0]
+    return {
+        "has_audio": True,
+        "codec": st.get("codec_name"),
+        "channels": st.get("channels"),
+        "sample_rate": st.get("sample_rate"),
+    }
+
+
+def extract_audio(video: Path, out_wav: Path, sr: int = 16000) -> Path:
+    """抽音轨为单声道 16k wav。"""
+    out_wav.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", str(video), "-vn", "-ac", "1", "-ar", str(sr),
+                    "-c:a", "pcm_s16le", str(out_wav)],
+                   check=True, timeout=900)
+    return out_wav
+
+
+def detect_silence(wav: Path, noise_db: float = -30.0, min_dur: float = 0.5):
+    """返回 (静音区间列表, 总时长)。"""
+    p = subprocess.run(
+        [FFMPEG, "-hide_banner", "-i", str(wav),
+         "-af", f"silencedetect=noise={noise_db}dB:d={min_dur}",
+         "-f", "null", "-"],
+        capture_output=True, text=True, timeout=900, errors="replace")
+    silences, cur = [], None
+    for line in (p.stderr or "").splitlines():
+        if "silence_start:" in line:
+            try:
+                cur = float(line.split("silence_start:")[1].split()[0])
+            except (IndexError, ValueError):
+                cur = None
+        elif "silence_end:" in line and cur is not None:
+            try:
+                silences.append((cur, float(line.split("silence_end:")[1].split()[0])))
+            except (IndexError, ValueError):
+                pass
+            cur = None
+    return silences, _probe_duration(wav)
+
+
+def audio_speech_ratio(wav: Path, noise_db: float = -30.0,
+                       min_dur: float = 0.5):
+    """返回 (有声比例, 静音区间, 总时长)。静音占比越低，有声比例越高。"""
+    silences, dur = detect_silence(wav, noise_db, min_dur)
+    if dur <= 0:
+        return 0.0, silences, dur
+    silent = sum(max(0.0, e - s) for s, e in silences)
+    return max(0.0, 1.0 - min(1.0, silent / dur)), silences, dur
+
+
+def strip_silence(wav: Path, out_wav: Path, noise_db: float = -30.0,
+                  min_dur: float = 0.5) -> Path:
+    """去掉静音段，输出精简音频。"""
+    out_wav.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", str(wav),
+         "-af", f"silenceremove=stop_periods=-1:stop_duration={min_dur}:"
+                f"stop_threshold={noise_db}dB",
+         "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(out_wav)],
+        check=True, timeout=900)
+    return out_wav
+
+
+def transcribe_audio(wav: Path, *, api_key: str, url: str = SF_ASR_URL,
+                     model: str = DEFAULT_ASR_MODEL, timeout: float = 300.0) -> str:
+    """调 ASR 接口转录，返回文本。"""
+    boundary = "----maasrboundary"
+    data = Path(wav).read_bytes()
+    body = b"".join([
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n".encode(),
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; "
+        f"filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\n".encode(),
+        data,
+        f"\r\n--{boundary}--\r\n".encode(),
+    ])
+    req = urllib.request.Request(url, data=body, headers={
+        "Authorization": "Bearer " + api_key,
+        "Content-Type": f"multipart/form-data; boundary={boundary}"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        resp = json.loads(r.read().decode("utf-8"))
+    return str(resp.get("text") or "")
+
+
+def transcript_core(text: str) -> str:
+    """提取转录里的实质字符（去掉音乐符号、标点、空白）。"""
+    if not text:
+        return ""
+    return "".join(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]", text))
+
+
+def audio_transcript(video: Path, *, out_dir: Path, api_key: str,
+                     noise_db: float = -30.0, min_silence: float = 0.5,
+                     min_speech_ratio: float = 0.02, min_core_chars: int = 4,
+                     timeout: float = 30.0,
+                     model: str = DEFAULT_ASR_MODEL) -> dict:
+    """完整音频链路：抽轨 → 静音分析 → 去静音 → 转录。
+
+    返回 dict：has_audio / speech_ratio / text / skipped / reason。
+    无音轨、几乎全静音、转录无实质内容时 skipped=True。
+    """
+    info = probe_audio(video)
+    if not info.get("has_audio"):
+        return {"has_audio": False, "skipped": True, "reason": "no_audio", "text": ""}
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    wav = extract_audio(video, out_dir / (video.stem + ".wav"))
+    ratio, _, dur = audio_speech_ratio(wav, noise_db, min_silence)
+    if ratio < min_speech_ratio:
+        return {"has_audio": True, "speech_ratio": ratio, "skipped": True,
+                "reason": "silent", "text": ""}
+
+    lean = strip_silence(wav, out_dir / (video.stem + ".lean.wav"),
+                         noise_db, min_silence)
+    try:
+        text = transcribe_audio(lean, api_key=api_key, model=model,
+                                timeout=timeout)
+    except Exception as e:  # 超时或上游异常：降级，不阻塞
+        return {"has_audio": True, "speech_ratio": ratio, "skipped": True,
+                "reason": "asr_failed", "error": type(e).__name__, "text": ""}
+    core = transcript_core(text)
+    if len(core) < min_core_chars:
+        return {"has_audio": True, "speech_ratio": ratio, "skipped": True,
+                "reason": "no_speech_content", "text": text}
+    return {"has_audio": True, "speech_ratio": ratio, "skipped": False,
+            "duration": dur, "text": text}
 
 
 # ---------------- 调试可视化 ----------------
