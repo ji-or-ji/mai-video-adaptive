@@ -107,7 +107,15 @@ python tools/cache_e2e_test.py  # 签名缓存
 - [x] 新颖率与动态上下限
 - [x] 音频链路（抽轨 / 静音分析 / 去静音 / 转录）
 - [x] 本地 ASR（sherpa-onnx SenseVoice）
-- [x] 三档音频模式
+- [x] 三档音频模式（含内存闸门与失败回退）
 - [x] 端到端理解与防幻觉约束
 - [x] 签名缓存去重
-- [ ] 接入麦麦插件
+- [x] 接入麦麦插件（`plugin/`）
+- [x] 配套 NapCat 插件取回群视频（`napcat-plugin/`）
+- [x] 服务器实测跑通
+
+## 麦麦插件
+
+`plugin/` 是可直接放进麦麦 `plugins/` 的插件。它另需一个配套的 NapCat 插件
+（`napcat-plugin/video-probe/`）——因为 QQ 不下载群视频原片，必须从 NapCat 的
+原始事件里拿真实 CDN 地址并下载。详见 `plugin/README.md`。

@@ -29,6 +29,15 @@ FFMPEG = "ffmpeg"
 FFPROBE = "ffprobe"
 
 
+def set_tools(ffmpeg: str | None = None, ffprobe: str | None = None) -> None:
+    """指定 ffmpeg / ffprobe 可执行文件路径（不填则用 PATH 里的）。"""
+    global FFMPEG, FFPROBE
+    if ffmpeg:
+        FFMPEG = ffmpeg
+    if ffprobe:
+        FFPROBE = ffprobe
+
+
 # ---------------- 基础执行 ----------------
 
 def _run(cmd, timeout=180):
