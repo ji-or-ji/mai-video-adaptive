@@ -588,14 +588,15 @@ def describe_video(frames, transcript: str = "", *, api_key: str,
                    timeout: float = 120.0, max_chars: int = 8000) -> str:
     """把关键帧（可选带语音转录）交给视觉模型，返回描述。"""
     if transcript:
-        prompt = ("这是从一段视频中按时间顺序抽取的关键帧。视频里还有人说话，"
-                  "语音转录如下：\n" + transcript[:max_chars] +
-                  "\n\n请综合画面和语音，概括这段视频讲了什么，200 字以内。"
-                  "注意：语音与画面可能来自不同内容。若两者明显对不上，"
-                  "以画面为准并直接说明存在不匹配，不要强行编造它们之间的关联。")
+        prompt = ("这是从一段视频中按时间顺序抽取的关键帧。视频里的语音转录如下：\n"
+                  + transcript[:max_chars] +
+                  "\n\n请综合画面和语音，用一段话概括这段视频的内容，200 字以内。"
+                  "以画面为主要依据，只写能从画面和语音中确认的内容，"
+                  "不要推测，也不要解释判断过程。")
     else:
         prompt = ("这是从一段视频中按时间顺序抽取的关键帧。"
-                  "请概括这段视频讲了什么，200 字以内。")
+                  "请用一段话概括这段视频的内容，200 字以内。"
+                  "只写能从画面中确认的内容，不要推测。")
     content = [{"type": "text", "text": prompt}]
     for f in frames:
         b = base64.b64encode(Path(f).read_bytes()).decode("ascii")
