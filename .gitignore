@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+assets/
+*.jpg
+*.jpeg
+*.png
+*.mp4
+*.mov
+*.mkv
+frames_*/
+out_*/
