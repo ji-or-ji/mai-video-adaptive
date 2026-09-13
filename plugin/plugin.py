@@ -15,8 +15,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-from maibot_sdk import Field, HookHandler, MaiBotPlugin, PluginConfigBase
-from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
+from maibot_sdk import Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
+from maibot_sdk.types import (ErrorPolicy, HookMode, HookOrder,
+                              ToolParameterInfo, ToolParamType)
 
 try:
     from . import adaptive_frames as af
@@ -184,6 +185,12 @@ class TimelineSection(PluginConfigBase):
                             json_schema_extra={"label": "保留天数", "order": 20})
     max_entries: int = Field(default=200, description="最多保留条数",
                              json_schema_extra={"label": "最大条数", "order": 30})
+    keep_video: bool = Field(
+        default=False,
+        description="保留原片，解锁「重读某段」工具；占磁盘，按下面小时数自动清理",
+        json_schema_extra={"label": "保留原片（占磁盘）", "order": 40})
+    keep_video_hours: float = Field(default=24.0, description="原片保留小时数",
+                                    json_schema_extra={"label": "原片保留（小时）", "order": 50})
 
 
 class VideoUnderstandConfig(PluginConfigBase):
@@ -229,6 +236,13 @@ class VideoUnderstandPlugin(MaiBotPlugin):
         ff = str(self.config.extract.ffmpeg_path or "").strip()
         fp = str(self.config.extract.ffprobe_path or "").strip()
         af.set_tools(ff or None, fp or None)
+        if self.config.timeline.keep_video:
+            try:
+                n = self._purge_kept()
+                if n:
+                    self.ctx.logger.info("清理过期原片 %d 个", n)
+            except Exception:  # noqa: BLE001
+                pass
         import shutil as _sh
         self.ctx.logger.info(
             "视频理解插件已加载 extract=%s/s audio=%s cache=%s ffmpeg=%s",
@@ -375,6 +389,113 @@ class VideoUnderstandPlugin(MaiBotPlugin):
             self.ctx.logger.warning("时间轴落盘失败：%s", exc)
             return ""
 
+    # ---- ③ 级：保留原片后的按需重读 ----
+
+    def _kept_dir(self) -> Path:
+        return Path(self.ctx.paths.data_dir) / "kept_videos"
+
+    def _kept_video_path(self, key: str) -> Path | None:
+        d = self._kept_dir()
+        if not d.is_dir():
+            return None
+        for p in d.glob(f"{key}.*"):
+            if p.is_file():
+                return p
+        return None
+
+    def _purge_kept(self) -> int:
+        """按保留小时数清理过期原片。"""
+        hours = float(self.config.timeline.keep_video_hours or 0)
+        if hours <= 0:
+            return 0
+        cutoff = time.time() - hours * 3600
+        n = 0
+        for p in self._kept_dir().glob("*"):
+            try:
+                if p.is_file() and p.stat().st_mtime < cutoff:
+                    p.unlink()
+                    n += 1
+            except Exception:  # noqa: BLE001
+                pass
+        return n
+
+    def _extract_range(self, video: Path, start: float, end: float,
+                       n: int = 8) -> list:
+        """在 [start, end] 内固定密度补抽帧（区间小，要精度不要效率）。"""
+        out = (Path(self.ctx.paths.runtime_dir) / "reread"
+               / f"{video.stem}_{int(start)}_{int(end)}")
+        step = max(0.5, (float(end) - float(start)) / max(1, n))
+        times = [float(start) + i * step for i in range(n)]
+        return af.extract_at(video, times, out,
+                             max_height=int(self.config.extract.max_height))
+
+    async def _read_segment(self, key: str, start: float, end: float) -> str:
+        if not bool(self.config.timeline.keep_video):
+            return "原片未保留，无法重读片段（可在配置里打开「保留原片」）。"
+        video = self._kept_video_path(key)
+        if video is None:
+            return f"没找到视频 #{key} 的原片，可能已过期。"
+        s = max(0.0, float(start))
+        e = float(end)
+        if e <= s:
+            e = s + 10.0
+        e = min(e, s + 120.0)
+        frames = await asyncio.to_thread(self._extract_range, video, s, e)
+        if not frames:
+            return f"视频 #{key} 在 {s:.0f}~{e:.0f} 秒抽帧失败。"
+        prompt = (f"这是一段视频 {af.fmt_ts(s)}~{af.fmt_ts(e)} 之间的画面。"
+                  "请完整描述这段区间里发生了什么：画面中的物体、文字、动作与变化。"
+                  "只写能从画面确认的内容，不推测。")
+        cfg = self.config
+        if str(cfg.vision.mode or "host").strip().lower() == "direct":
+            res = await asyncio.to_thread(
+                af.describe_video, frames, "", api_key=str(cfg.vision.api_key),
+                url=str(cfg.vision.api_url), model=str(cfg.vision.model),
+                timeout=float(cfg.vision.timeout_s))
+            return str(res.get("text") or res.get("raw") or "").strip()
+        content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        for f in frames:
+            b64 = base64.b64encode(Path(f).read_bytes()).decode("ascii")
+            content.append({"type": "image", "image_format": "jpeg",
+                            "image_base64": b64})
+        result = await self.ctx.llm.generate(
+            [{"role": "user", "content": content}],
+            model=str(cfg.vision.host_task or "vlm"))
+        if isinstance(result, dict):
+            if result.get("success") is False:
+                raise RuntimeError(str(result.get("error") or "宿主模型调用失败"))
+            result = (result.get("response") or result.get("content")
+                      or result.get("text") or "")
+        return str(result or "").strip()
+
+    @Tool(
+        "read_video",
+        description=("重看某条视频的某个时间段并描述细节。"
+                     "video_id 用上下文里「视频#xxxxxxxx」中的那串标识。"),
+        parameters=[
+            ToolParameterInfo(name="video_id", param_type=ToolParamType.STRING,
+                              description="视频标识（如 a3f2b1c9d4e5f6a7）",
+                              required=True),
+            ToolParameterInfo(name="start", param_type=ToolParamType.FLOAT,
+                              description="起始秒数", required=True),
+            ToolParameterInfo(name="end", param_type=ToolParamType.FLOAT,
+                              description="结束秒数", required=True),
+        ],
+    )
+    async def handle_read_video(self, video_id: str = "", start: float = 0,
+                                end: float = 0, **kwargs: Any) -> dict[str, Any]:
+        """按时间区间重读视频片段（需要已保留原片）。"""
+        del kwargs
+        try:
+            text = await self._read_segment(str(video_id or "").strip(),
+                                            float(start), float(end))
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.logger.warning("重读片段失败 %s: %s", video_id, exc)
+            text = f"重读片段失败：{exc}"
+        self.ctx.logger.info("重读片段 video=%s %s~%s -> %s",
+                             video_id, start, end, str(text)[:80])
+        return {"name": "read_video", "content": text}
+
     # ---- 处理流水线 ----
 
     async def _handle(self, asset: media_mod.VideoAsset, stream_id: str) -> None:
@@ -385,6 +506,7 @@ class VideoUnderstandPlugin(MaiBotPlugin):
         if name.startswith("/"):
             self.ctx.logger.info("跳过转发消息内的视频（无本地实体）：%s", name[:80])
             return
+        key = ""
         async with self._sem:
             try:
                 video_path = await self._materialize(asset)
@@ -419,13 +541,27 @@ class VideoUnderstandPlugin(MaiBotPlugin):
                                         traceback.format_exc()[-800:])
             finally:
                 if bool(self.config.source.cleanup_after):
-                    await asyncio.to_thread(self._cleanup, asset, video_path)
+                    await asyncio.to_thread(self._cleanup, asset, video_path, key)
 
     def _cleanup(self, asset: media_mod.VideoAsset, video_path: Path | None) -> None:
-        """清理视频本体与中间产物（帧 / 音频）。描述已入签名缓存，删除不影响复用。"""
+        """清理视频本体与中间产物（帧 / 音频）。描述已入签名缓存，删除不影响复用。
 
+        keep_video 打开时，先把原片备份到数据目录，再照常清理。
+        """
         import shutil as _sh
         removed = []
+
+        # 0) 需要保留原片时先备份（供 read_video 工具重读片段）
+        if key and bool(self.config.timeline.keep_video) and video_path is not None:
+            src = Path(video_path)
+            if src.is_file():
+                try:
+                    dst = self._kept_dir() / f"{key}{src.suffix or '.mp4'}"
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    _sh.copy2(src, dst)
+                    removed.append(f"kept:{dst.name}")
+                except Exception as exc:  # noqa: BLE001
+                    self.ctx.logger.warning("保留原片失败 %s: %s", key, exc)
 
         # 1) 取回的视频本体（可能在 NapCat 下载目录，也可能在本地运行时目录）
         cands = []
