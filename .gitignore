@@ -10,3 +10,5 @@ assets/
 *.mkv
 frames_*/
 out_*/
+tools/_*/
+*.wav
