@@ -12,11 +12,16 @@ let logger = null;
 const tag = "[video-fetch]";
 
 // ---- 下载目标安全校验（防 SSRF）----
-// 事件里的 data.url 可能受消息内容影响，不能只要 http/https 就下。
-// 两道：域名必须在 QQ 媒体白名单内；解析后的 IP 不得是内网/元数据地址。
-const ALLOWED_HOST_SUFFIX = [
-    ".qq.com", ".qq.com.cn", ".gtimg.com", ".qpic.cn", ".tencent.com",
-];
+// 两层：
+//   1. 私网/元数据地址拦截 —— 硬底线，默认永远生效（内网地址定义不会变）
+//   2. 域名白名单 —— 可选收紧项，默认不限
+// 白名单不作默认，因为它依赖 QQ 当前的 CDN 域名；对方一换域名就会误杀，
+// 属于会随外部变化失效的约束。需要更严时用环境变量补上（逗号分隔后缀）：
+//   VIDEO_FETCH_ALLOWED_HOSTS=.qq.com,.gtimg.com
+const ALLOWED_HOST_SUFFIX = String(process.env.VIDEO_FETCH_ALLOWED_HOSTS || "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
 
 const MAX_BYTES = 500 * 1024 * 1024;
 
@@ -30,8 +35,12 @@ const ipIsPrivate = (ip) => {
     const v = String(ip || "").toLowerCase();
     if (!v) return true;
     if (v.includes(":")) {
+        // IPv4-mapped（::ffff:127.0.0.1）取出来按 v4 再判一次
+        const m = v.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+        if (m) return ipIsPrivate(m[1]);
         return v === "::1" || v === "::" ||
-            v.startsWith("fe80") || v.startsWith("fc") || v.startsWith("fd");
+            v.startsWith("fe80") || v.startsWith("fc") || v.startsWith("fd") ||
+            v.startsWith("ff") || v.startsWith("2001:db8");
     }
     const p = v.split(".").map(Number);
     if (p.length !== 4 || p.some((n) => !Number.isInteger(n))) return true;
@@ -55,7 +64,7 @@ const assertSafeUrl = async (rawUrl) => {
     if (u.protocol !== "https:" && u.protocol !== "http:") {
         throw new Error(`非 http(s) 协议: ${u.protocol}`);
     }
-    if (!hostAllowed(u.hostname)) {
+    if (ALLOWED_HOST_SUFFIX.length && !hostAllowed(u.hostname)) {
         throw new Error(`域名不在白名单: ${u.hostname}`);
     }
     const addrs = await dns.promises.lookup(u.hostname, { all: true });
