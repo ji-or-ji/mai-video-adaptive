@@ -22,7 +22,9 @@
   "dependencies": [],
   "capabilities": [
     "llm.generate",
-    "api.call"
+    "api.call",
+    "component.enable",
+    "component.disable"
   ],
   "i18n": {
     "default_locale": "zh-CN",
