@@ -9,7 +9,7 @@
   },
   "license": "MIT",
   "urls": {
-    "repository": "https://github.com/ji-or-ji/mai-video-understanding"
+    "repository": "https://github.com/ji-or-ji/mai-video-adaptive"
   },
   "host_application": {
     "min_version": "1.0.0",
@@ -26,12 +26,5 @@
     "component.enable",
     "component.disable"
   ],
-  "i18n": {
-    "default_locale": "zh-CN",
-    "locales_path": "_locales",
-    "supported_locales": [
-      "zh-CN"
-    ]
-  },
   "id": "ji-or-ji.video-understanding"
 }

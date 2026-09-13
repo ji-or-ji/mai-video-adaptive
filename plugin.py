@@ -618,7 +618,31 @@ class VideoUnderstandPlugin(MaiBotPlugin):
                 if bool(self.config.source.cleanup_after):
                     await asyncio.to_thread(self._cleanup, asset, video_path, key)
 
-    def _cleanup(self, asset: media_mod.VideoAsset, video_path: Path | None) -> None:
+    @staticmethod
+    def _safe_child(base: Path, name: str) -> Path | None:
+        """把文件名拼到 base 下；越界（`..`、绝对路径、盘符）返回 None。
+
+        asset.name / file_ref 是从消息文本里抽出来的，可以被伪造（例如骗造
+        `[视频] 文件: ..\\..\\xxx`）。必须确保解析后仍落在 base 内，
+        否则宁可不解引用。
+        """
+        raw = str(name or "").strip()
+        if not raw:
+            return None
+        leaf = Path(raw.replace("\\", "/")).name
+        if not leaf or leaf in (".", ".."):
+            return None
+        try:
+            base_r = base.resolve()
+            cand = (base / leaf).resolve()
+        except Exception:  # noqa: BLE001
+            return None
+        if cand != base_r and base_r not in cand.parents:
+            return None
+        return cand
+
+    def _cleanup(self, asset: media_mod.VideoAsset, video_path: Path | None,
+                 key: str = "") -> None:
         """清理视频本体与中间产物（帧 / 音频）。描述已入签名缓存，删除不影响复用。
 
         keep_video 打开时，先把原片备份到数据目录，再照常清理。
@@ -644,9 +668,15 @@ class VideoUnderstandPlugin(MaiBotPlugin):
             cands.append(Path(video_path))
         fetch_dir = str(self.config.napcat.fetch_dir or "").strip()
         if fetch_dir:
+            base = Path(fetch_dir)
             for name in (asset.name, asset.file_ref):
-                if name:
-                    cands.append(Path(fetch_dir) / name)
+                cand = self._safe_child(base, name)
+                if cand is None:
+                    if name:
+                        self.ctx.logger.warning(
+                            "拒绝可疑路径（越出取回目录）: %s", str(name)[:120])
+                    continue
+                cands.append(cand)
         for p in cands:
             try:
                 if p.is_file():
