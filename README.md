@@ -166,6 +166,9 @@ sherpa-onnx 的 SenseVoice（int8，约 228MB）：
 | `min_free_mb` | 500 | 本地模型内存门槛 |
 | `fallback` | true | 首选途径失败时回退另一种 |
 | `unload_after` | true | 转录后卸载本地模型 |
+| `block_seconds` | 120 | 单块音频最长秒数（越大调用越少、越快） |
+| `gap_seconds` | 6 | 语音间停顿短于此值就并成一块（越大越省调用，但多送静音） |
+| `max_audio_seconds` | 600 | 只转录前 N 秒，0 表示不限（防超长视频） |
 
 ## 声画双轨
 
