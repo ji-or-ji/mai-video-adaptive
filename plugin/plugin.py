@@ -232,6 +232,11 @@ class VideoUnderstandPlugin(MaiBotPlugin):
                 self.ctx.paths.data_dir,
                 ttl_days=float(self.config.timeline.ttl_days),
                 max_entries=int(self.config.timeline.max_entries))
+        self.ctx.logger.info(
+            "时间轴初始化 enabled=%s store=%s data_dir=%s",
+            self.config.timeline.enabled,
+            self._store is not None,
+            self.ctx.paths.data_dir)
         # 指定 ffmpeg / ffprobe（进程继承的 PATH 可能不含它们）
         ff = str(self.config.extract.ffmpeg_path or "").strip()
         fp = str(self.config.extract.ffprobe_path or "").strip()
@@ -308,9 +313,18 @@ class VideoUnderstandPlugin(MaiBotPlugin):
         if _M_PENDING not in plain and _M_DONE not in plain:
             message["processed_plain_text"] = f"{plain}\n{line}".strip() if plain else line
 
-        self.ctx.logger.info("检测到 %d 个视频 session=%s", len(assets), stream_id or "-")
+        msg_info = message.get("message_info")
+        group_info = (msg_info.get("group_info")
+                      if isinstance(msg_info, dict) else None)
+        group_id = (str(group_info.get("group_id") or "")
+                    if isinstance(group_info, dict) else "")
+        message_id = str(message.get("message_id") or "")
+        self.ctx.logger.info("检测到 %d 个视频 session=%s group=%s msg=%s",
+                             len(assets), stream_id or "-", group_id or "-",
+                             message_id or "-")
         for asset in assets:
-            task = asyncio.create_task(self._handle(asset, stream_id))
+            task = asyncio.create_task(
+                self._handle(asset, stream_id, group_id, message_id))
             self._bg.add(task)
             task.add_done_callback(self._bg.discard)
 
@@ -386,10 +400,12 @@ class VideoUnderstandPlugin(MaiBotPlugin):
         return {"action": "continue", "modified_kwargs": new_kwargs}
 
     def _remember(self, desc: dict[str, Any], prep: dict[str, Any],
-                  stream_id: str) -> str:
+                  stream_id: str, group_id: str = "",
+                  message_id: str = "") -> str:
         """完整时间轴落盘，返回注入上下文用的短标识。
 
         摘要常驻上下文，完整时间轴落盘按需查（见 README 的设计原则）。
+        已存在则保留首次记录，不覆盖，避免后到的缓存命中把 message_id 清掉。
         """
         store = self._store
         sig = prep.get("sig")
@@ -397,10 +413,18 @@ class VideoUnderstandPlugin(MaiBotPlugin):
             return ""
         try:
             key = tl_store.sig_key(sig)
+            if store.load(key):
+                return key
             store.save(key, segments=desc.get("segments") or [],
                        summary=desc.get("summary") or desc.get("text") or "",
                        duration=float(prep.get("duration") or 0.0),
-                       group_id=stream_id)
+                       group_id=group_id or stream_id,
+                       message_id=message_id,
+                       video_kept=bool(self.config.timeline.keep_video))
+            self.ctx.logger.info(
+                "时间轴已落盘 key=%s group=%s msg=%s segs=%d",
+                key, group_id or stream_id, message_id or "-",
+                len(desc.get("segments") or []))
             return key
         except Exception as exc:  # noqa: BLE001
             self.ctx.logger.warning("时间轴落盘失败：%s", exc)
@@ -538,7 +562,8 @@ class VideoUnderstandPlugin(MaiBotPlugin):
 
     # ---- 处理流水线 ----
 
-    async def _handle(self, asset: media_mod.VideoAsset, stream_id: str) -> None:
+    async def _handle(self, asset: media_mod.VideoAsset, stream_id: str,
+                      group_id: str = "", message_id: str = "") -> None:
         assert self._sem is not None
         video_path: Path | None = None
         name = str(asset.name or asset.file_ref or "")
@@ -567,7 +592,7 @@ class VideoUnderstandPlugin(MaiBotPlugin):
                             segments=desc.get("segments"),
                             summary=desc.get("summary"))
                 text = desc["text"]
-                key = self._remember(desc, prep, stream_id)
+                key = self._remember(desc, prep, stream_id, group_id, message_id)
                 self._session_latest[stream_id] = {
                     "text": text, "ts": time.time(), "key": key,
                     "segments": desc.get("segments") or [],
@@ -796,6 +821,7 @@ class VideoUnderstandPlugin(MaiBotPlugin):
             hit = cache.lookup(sig)
             if hit:
                 return {"cached": True, "text": hit["text"], "sig": sig,
+                        "duration": float(info.get("duration") or 0.0),
                         "segments": hit.get("segments") or [],
                         "summary": hit.get("summary") or hit["text"]}
 

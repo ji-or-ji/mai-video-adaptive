@@ -37,13 +37,15 @@
 ## 存储
 
 ```
-plugins/data/video-understanding/
+<ctx.paths.data_dir>            # 实测为 MaiBot/data/plugins/<插件id>/
 ├── timeline/
 │   └── <签名>.json        # 完整时间轴，总是写
-├── index.json             # 签名 → 群 / 时间 / 压缩版描述
+├── timeline_index.json    # 签名 → 群 / 消息id / 时间 / 压缩版描述
 └── video/                 # 仅 keep_video = true
     └── <签名>.mp4
 ```
+
+注：`<ctx.paths.data_dir>` 不是 `plugins/data/`，而是 `MaiBot/data/plugins/<插件id>/`。
 
 **key 复用已有的视频签名**：描述、时间轴、原片三份数据自动关联，不另造索引。
 
