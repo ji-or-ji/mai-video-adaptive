@@ -421,6 +421,41 @@ def audio_speech_ratio(wav: Path, noise_db: float = -30.0,
     return max(0.0, 1.0 - min(1.0, silent / dur)), silences, dur
 
 
+def speech_spans(silences, total: float, min_gap: float = 0.05) -> list:
+    """由静音区间反推语音区间，返回 [(start, end), ...]。"""
+    spans, cursor = [], 0.0
+    for s, e in (silences or []):
+        if s > cursor + min_gap:
+            spans.append((cursor, min(s, total)))
+        cursor = max(cursor, e)
+    if total > cursor + min_gap:
+        spans.append((cursor, total))
+    return [(a, b) for a, b in spans if b > a]
+
+
+def merge_spans(spans, max_len: float = 60.0, gap: float = 1.5) -> list:
+    """把碎语音区间合并成块，减少 ASR 调用次数。"""
+    out: list[list[float]] = []
+    for s, e in (spans or []):
+        if out and (e - out[-1][0]) <= max_len and (s - out[-1][1]) <= gap:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return [(a, b) for a, b in out]
+
+
+def cut_audio(wav: Path, out_wav: Path, start: float, end: float) -> Path:
+    """切出 [start, end] 的音频片段（16k 单声道）。"""
+    out_wav.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+         "-ss", f"{max(0.0, start):.3f}", "-to", f"{max(0.0, end):.3f}",
+         "-i", str(wav), "-ac", "1", "-ar", "16000",
+         "-c:a", "pcm_s16le", str(out_wav)],
+        check=True, timeout=300)
+    return out_wav
+
+
 def strip_silence(wav: Path, out_wav: Path, noise_db: float = -30.0,
                   min_dur: float = 0.5) -> Path:
     """去掉静音段，输出精简音频。"""
@@ -503,7 +538,8 @@ def audio_transcript(video: Path, *, out_dir: Path, mode: str = ASR_MODE_OFF,
                      min_silence: float = 0.5, min_speech_ratio: float = 0.02,
                      min_core_chars: int = 4, timeout: float = 30.0,
                      model: str = DEFAULT_ASR_MODEL, min_free_mb: float = 500.0,
-                     fallback: bool = True, unload_after: bool = True) -> dict:
+                     fallback: bool = True, unload_after: bool = True,
+                     block_s: float = 60.0) -> dict:
     """完整音频链路：抽轨 → 静音分析 → 去静音 → 转录。
 
     mode（首选途径）：
@@ -524,22 +560,27 @@ def audio_transcript(video: Path, *, out_dir: Path, mode: str = ASR_MODE_OFF,
 
     out_dir.mkdir(parents=True, exist_ok=True)
     wav = extract_audio(video, out_dir / (video.stem + ".wav"))
-    ratio, _, dur = audio_speech_ratio(wav, noise_db, min_silence)
+    ratio, silences, dur = audio_speech_ratio(wav, noise_db, min_silence)
     if ratio < min_speech_ratio:
         return {"mode": mode, "has_audio": True, "speech_ratio": ratio,
-                "skipped": True, "reason": "silent", "text": ""}
+                "skipped": True, "reason": "silent", "text": "",
+                "segments": []}
 
-    lean = strip_silence(wav, out_dir / (video.stem + ".lean.wav"),
-                         noise_db, min_silence)
+    # 按静音切出语音区间，再合并成块：逐块转录才能带上时间戳，
+    # 且块之间不会把时间轴弄错位（旧实现是全局去静音，时间对不上）。
+    blocks = merge_spans(speech_spans(silences, dur), max_len=block_s)
+    if not blocks:
+        blocks = [(0.0, max(0.0, dur))]
 
     order = [mode]
     if fallback:
         order.append(ASR_MODE_LOCAL if mode == ASR_MODE_API else ASR_MODE_API)
 
     tried: list[str] = []
-    text = ""
+    segments: list[dict] = []
     used = ""
     for approach in order:
+        segments = []
         try:
             if approach == ASR_MODE_LOCAL:
                 if not (local_model and local_tokens):
@@ -549,16 +590,26 @@ def audio_transcript(video: Path, *, out_dir: Path, mode: str = ASR_MODE_OFF,
                 if 0 <= free < min_free_mb:
                     tried.append(f"local:内存不足({free:.0f}MB<{min_free_mb:.0f}MB)")
                     continue
-                text = transcribe_local(lean, model=Path(local_model),
-                                        tokens=Path(local_tokens),
-                                        num_threads=num_threads)
+                for i, (a, b) in enumerate(blocks):
+                    seg_wav = out_dir / f"{video.stem}.blk{i}.wav"
+                    cut_audio(wav, seg_wav, a, b)
+                    t = transcribe_local(seg_wav, model=Path(local_model),
+                                         tokens=Path(local_tokens),
+                                         num_threads=num_threads)
+                    if transcript_core(t):
+                        segments.append({"start": a, "end": b, "text": t.strip()})
                 used = "local"
                 break
             if not api_key:
                 tried.append("api:未配置 Key")
                 continue
-            text = transcribe_audio(lean, api_key=api_key, model=model,
-                                    timeout=timeout)
+            for i, (a, b) in enumerate(blocks):
+                seg_wav = out_dir / f"{video.stem}.blk{i}.wav"
+                cut_audio(wav, seg_wav, a, b)
+                t = transcribe_audio(seg_wav, api_key=api_key, model=model,
+                                     timeout=timeout)
+                if transcript_core(t):
+                    segments.append({"start": a, "end": b, "text": t.strip()})
             used = "api"
             break
         except Exception as exc:  # noqa: BLE001
@@ -569,15 +620,19 @@ def audio_transcript(video: Path, *, out_dir: Path, mode: str = ASR_MODE_OFF,
 
     if not used:
         return {"mode": mode, "has_audio": True, "speech_ratio": ratio,
-                "skipped": True, "reason": "asr_failed", "tried": tried, "text": ""}
+                "skipped": True, "reason": "asr_failed", "tried": tried,
+                "text": "", "segments": []}
 
+    text = " ".join(str(s.get("text") or "") for s in segments).strip()
     core = transcript_core(text)
     if len(core) < min_core_chars:
         return {"mode": mode, "used": used, "has_audio": True,
                 "speech_ratio": ratio, "skipped": True,
-                "reason": "no_speech_content", "text": text}
+                "reason": "no_speech_content", "text": text,
+                "segments": segments}
     return {"mode": mode, "used": used, "has_audio": True,
-            "speech_ratio": ratio, "skipped": False, "duration": dur, "text": text}
+            "speech_ratio": ratio, "skipped": False, "duration": dur,
+            "text": text, "segments": segments}
 
 
 # ---------------- 本地 ASR（可选，无网络） ----------------
@@ -864,6 +919,7 @@ def understand_video(video: Path, *, out_dir: Path, asr_mode: str = ASR_MODE_OFF
                              api_key=api_key, local_model=local_model,
                              local_tokens=local_tokens)
     transcript = "" if audio.get("skipped") else audio.get("text", "")
+    audio_segments = audio.get("segments") or []
     result = describe_video(frames, transcript, frame_times=plan.times,
                             api_key=vision_api_key, url=vision_url,
                             model=vision_model, timeout=vision_timeout,
@@ -878,6 +934,7 @@ def understand_video(video: Path, *, out_dir: Path, asr_mode: str = ASR_MODE_OFF
             "description": desc, "segments": result.get("segments") or [],
             "summary": result.get("summary") or desc,
             "raw": result.get("raw", desc), "usage": result.get("usage") or {},
+            "audio_segments": audio_segments,
             "elapsed": time.time() - t0}
 
 
