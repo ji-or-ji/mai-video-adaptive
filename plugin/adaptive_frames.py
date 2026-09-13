@@ -539,7 +539,8 @@ def audio_transcript(video: Path, *, out_dir: Path, mode: str = ASR_MODE_OFF,
                      min_core_chars: int = 4, timeout: float = 30.0,
                      model: str = DEFAULT_ASR_MODEL, min_free_mb: float = 500.0,
                      fallback: bool = True, unload_after: bool = True,
-                     block_s: float = 60.0) -> dict:
+                     block_s: float = 120.0, gap_s: float = 6.0,
+                     max_audio_s: float = 600.0) -> dict:
     """完整音频链路：抽轨 → 静音分析 → 去静音 → 转录。
 
     mode（首选途径）：
@@ -568,9 +569,14 @@ def audio_transcript(video: Path, *, out_dir: Path, mode: str = ASR_MODE_OFF,
 
     # 按静音切出语音区间，再合并成块：逐块转录才能带上时间戳，
     # 且块之间不会把时间轴弄错位（旧实现是全局去静音，时间对不上）。
-    blocks = merge_spans(speech_spans(silences, dur), max_len=block_s)
+    # 块调大是为了压调用次数（快、省），上限截断防超长视频失控。
+    blocks = merge_spans(speech_spans(silences, dur), max_len=block_s,
+                         gap=gap_s)
+    if max_audio_s and max_audio_s > 0:
+        blocks = [(a, min(b, float(max_audio_s)))
+                  for a, b in blocks if a < float(max_audio_s)]
     if not blocks:
-        blocks = [(0.0, max(0.0, dur))]
+        blocks = [(0.0, min(max(0.0, dur), float(max_audio_s) or dur))]
 
     order = [mode]
     if fallback:

@@ -102,6 +102,16 @@ class AudioSection(PluginConfigBase):
                            json_schema_extra={"label": "失败回退", "order": 90})
     unload_after: bool = Field(default=True, description="转录后卸载本地模型，释放内存",
                                json_schema_extra={"label": "用完卸载", "order": 100})
+    block_seconds: float = Field(
+        default=120.0, description="单块音频最长秒数；越大调用越少、越快",
+        json_schema_extra={"label": "单块最长（秒）", "order": 110})
+    gap_seconds: float = Field(
+        default=6.0,
+        description="语音之间停顿短于该值就并成一块；越大调用越少，但会多送静音",
+        json_schema_extra={"label": "停顿合并（秒）", "order": 120})
+    max_audio_seconds: float = Field(
+        default=600.0, description="只转录前 N 秒音频，0 表示不限；防超长视频",
+        json_schema_extra={"label": "总时长上限（秒，0=不限）", "order": 130})
 
 
 class VisionSection(PluginConfigBase):
@@ -842,7 +852,10 @@ class VideoUnderstandPlugin(MaiBotPlugin):
             timeout=float(cfg.audio.timeout_s),
             min_free_mb=float(cfg.audio.min_free_mb),
             fallback=bool(cfg.audio.fallback),
-            unload_after=bool(cfg.audio.unload_after))
+            unload_after=bool(cfg.audio.unload_after),
+            block_s=float(cfg.audio.block_seconds),
+            gap_s=float(cfg.audio.gap_seconds),
+            max_audio_s=float(cfg.audio.max_audio_seconds))
         transcript = "" if audio.get("skipped") else str(audio.get("text") or "")
 
         return {"cached": False, "frames": frames, "transcript": transcript,
