@@ -1,0 +1,9 @@
+{
+  "name": "video-fetch",
+  "plugin": "视频取回",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "index.mjs",
+  "description": "从视频消息里取真实 CDN 地址并下载到本地，供麦麦视频理解插件读取",
+  "author": "ji-or-ji"
+}

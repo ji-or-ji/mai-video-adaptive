@@ -21,9 +21,11 @@ from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 try:
     from . import adaptive_frames as af
     from . import media as media_mod
+    from . import timeline_store as tl_store
 except ImportError:  # PluginLoader 以文件方式加载
     import adaptive_frames as af  # type: ignore
     import media as media_mod  # type: ignore
+    import timeline_store as tl_store  # type: ignore
 
 
 _M_PENDING = "[视频理解中]"
@@ -170,6 +172,20 @@ class SourceSection(PluginConfigBase):
                              json_schema_extra={"label": "并发数", "order": 40})
 
 
+class TimelineSection(PluginConfigBase):
+    __ui_label__ = "时间轴"
+    __ui_order__ = 7
+
+    enabled: bool = Field(
+        default=True,
+        description="保留带时间戳的分段描述，支持「某一时刻是什么」这类提问",
+        json_schema_extra={"label": "启用时间轴", "order": 10})
+    ttl_days: float = Field(default=7.0, description="时间轴保留天数",
+                            json_schema_extra={"label": "保留天数", "order": 20})
+    max_entries: int = Field(default=200, description="最多保留条数",
+                             json_schema_extra={"label": "最大条数", "order": 30})
+
+
 class VideoUnderstandConfig(PluginConfigBase):
     __ui_label__ = "视频理解"
 
@@ -180,6 +196,7 @@ class VideoUnderstandConfig(PluginConfigBase):
     cache: CacheSection = Field(default_factory=CacheSection)
     napcat: NapcatSection = Field(default_factory=NapcatSection)
     source: SourceSection = Field(default_factory=SourceSection)
+    timeline: TimelineSection = Field(default_factory=TimelineSection)
 
 
 # ------------------------------------------------------------------
@@ -196,12 +213,18 @@ class VideoUnderstandPlugin(MaiBotPlugin):
         self._sem: asyncio.Semaphore | None = None
         self._session_latest: dict[str, dict[str, Any]] = {}
         self._bg: set[asyncio.Task[Any]] = set()
+        self._store: Any = None
 
     # ---- 生命周期 ----
 
     async def on_load(self) -> None:
         self._sem = asyncio.Semaphore(max(1, int(self.config.source.concurrency)))
         Path(self.ctx.paths.runtime_dir).mkdir(parents=True, exist_ok=True)
+        if self.config.timeline.enabled:
+            self._store = tl_store.TimelineStore(
+                self.ctx.paths.data_dir,
+                ttl_days=float(self.config.timeline.ttl_days),
+                max_entries=int(self.config.timeline.max_entries))
         # 指定 ffmpeg / ffprobe（进程继承的 PATH 可能不含它们）
         ff = str(self.config.extract.ffmpeg_path or "").strip()
         fp = str(self.config.extract.ffprobe_path or "").strip()
@@ -294,6 +317,9 @@ class VideoUnderstandPlugin(MaiBotPlugin):
             return None
 
         text = str(record["text"]).strip()
+        ref = str(record.get("key") or "").strip()
+        if ref:
+            text = f"（视频#{ref}）\n{text}"
 
         # 已在上下文里则不重复注入
         for it in items:
@@ -328,22 +354,62 @@ class VideoUnderstandPlugin(MaiBotPlugin):
                              new_kwargs.get("item_schema_version"), block[:120])
         return {"action": "continue", "modified_kwargs": new_kwargs}
 
+    def _remember(self, desc: dict[str, Any], prep: dict[str, Any],
+                  stream_id: str) -> str:
+        """完整时间轴落盘，返回注入上下文用的短标识。
+
+        摘要常驻上下文，完整时间轴落盘按需查（见 README 的设计原则）。
+        """
+        store = self._store
+        sig = prep.get("sig")
+        if store is None or not sig:
+            return ""
+        try:
+            key = tl_store.sig_key(sig)
+            store.save(key, segments=desc.get("segments") or [],
+                       summary=desc.get("summary") or desc.get("text") or "",
+                       duration=float(prep.get("duration") or 0.0),
+                       group_id=stream_id)
+            return key
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.logger.warning("时间轴落盘失败：%s", exc)
+            return ""
+
     # ---- 处理流水线 ----
 
     async def _handle(self, asset: media_mod.VideoAsset, stream_id: str) -> None:
         assert self._sem is not None
         video_path: Path | None = None
+        name = str(asset.name or asset.file_ref or "")
+        # 转发消息可能带发送方手机的路径（/storage/emulated/...），本地不存在，直接放弃
+        if name.startswith("/"):
+            self.ctx.logger.info("跳过转发消息内的视频（无本地实体）：%s", name[:80])
+            return
         async with self._sem:
             try:
                 video_path = await self._materialize(asset)
                 prep = await asyncio.to_thread(self._prepare, video_path)
                 if prep.get("cached"):
-                    text = prep["text"]
+                    desc = {"cached": True,
+                            "segments": prep.get("segments") or [],
+                            "summary": prep.get("summary") or prep["text"],
+                            "raw": prep["text"], "text": prep["text"]}
                 else:
-                    text = await self._describe(prep["frames"], prep["transcript"])
-                    if prep.get("cache") is not None and text:
-                        prep["cache"].remember(prep["sig"], text, asset.name or asset.file_ref)
-                self._session_latest[stream_id] = {"text": text, "ts": time.time()}
+                    desc = await self._describe(
+                        prep["frames"], prep["transcript"],
+                        prep.get("frame_times"), prep.get("duration"))
+                    if prep.get("cache") is not None and desc.get("text"):
+                        prep["cache"].remember(
+                            prep["sig"], desc["text"],
+                            asset.name or asset.file_ref,
+                            segments=desc.get("segments"),
+                            summary=desc.get("summary"))
+                text = desc["text"]
+                key = self._remember(desc, prep, stream_id)
+                self._session_latest[stream_id] = {
+                    "text": text, "ts": time.time(), "key": key,
+                    "segments": desc.get("segments") or [],
+                    "summary": desc.get("summary") or text}
                 self.ctx.logger.info("视频理解完成 name=%s text=%s",
                                      asset.name or asset.file_ref, text[:80])
             except Exception as exc:  # noqa: BLE001
@@ -409,6 +475,9 @@ class VideoUnderstandPlugin(MaiBotPlugin):
             got = await self._wait_fetched(fetch_dir, asset)
             if got is not None and got.stat().st_size <= max_bytes:
                 return got
+            # 配了取回目录却拿不到：不再回退 get_file（QQ 不下原片，那条路必死）
+            self.ctx.logger.info("取回目录未拿到视频，放弃 name=%s", asset.name or asset.file_ref)
+            raise FileNotFoundError(f"取回目录未找到视频：{asset.name or asset.file_ref}")
 
         # 2) 自带来源（url / base64 / 本地路径）
         if asset.url or asset.base64_data or asset.local_path:
@@ -432,32 +501,38 @@ class VideoUnderstandPlugin(MaiBotPlugin):
             media_mod.save_bytes, raw, target_dir=runtime, name=name, key=asset.key)
 
     async def _wait_fetched(self, fetch_dir: str, asset: media_mod.VideoAsset) -> Path | None:
-        """等待取回目录里出现目标视频（按 latest.json 的 done 状态或同名文件判定）。"""
+        """等待取回目录里出现**当前这条且已写完**的视频。
+
+    两个坑：
+      1. latest.json 只保留最后一条记录，必须校验文件名，否则会拿错文件；
+      2. 文件刚创建时就在写，必须等大小稳定，否则 ffprobe 拿到的是半截文件。
+    """
 
         import json as _json
 
         names = [n for n in (asset.name, asset.file_ref) if n]
+        if not names:
+            return None
+        name_set = {Path(n).name for n in names}
         deadline = time.time() + max(1.0, float(self.config.napcat.fetch_wait_s))
         dir_path = Path(fetch_dir)
+        stable: dict[str, tuple[int, int]] = {}
 
         while time.time() < deadline:
-            # a) 看 latest.json 是否已完成且对得上
-            record = dir_path / "latest.json"
-            if record.is_file():
-                try:
-                    info = _json.loads(record.read_text(encoding="utf-8"))
-                except Exception:
-                    info = {}
-                if str(info.get("phase")) == "done":
-                    saved = str(info.get("saved") or "")
-                    if saved and Path(saved).is_file():
-                        return Path(saved)
-            # b) 直接找同名文件
-            for name in names:
+            for name in name_set:
                 cand = dir_path / name
-                if cand.is_file() and cand.stat().st_size > 0:
+                try:
+                    size = cand.stat().st_size if cand.is_file() else -1
+                except OSError:
+                    size = -1
+                if size <= 0:
+                    stable.pop(name, None)
+                    continue
+                # 大小连续两次采样一致，才认为写完
+                if stable.get(name, (-1, 0))[0] == size:
                     return cand
-            await asyncio.sleep(2.0)
+                stable[name] = (size, 0)
+            await asyncio.sleep(1.5)
         return None
 
     async def _fetch_via_napcat(self, file_ref: str) -> bytes:
@@ -544,11 +619,13 @@ class VideoUnderstandPlugin(MaiBotPlugin):
             sig = cache.signature(video, info["duration"])
             hit = cache.lookup(sig)
             if hit:
-                return {"cached": True, "text": hit["text"]}
+                return {"cached": True, "text": hit["text"], "sig": sig,
+                        "segments": hit.get("segments") or [],
+                        "summary": hit.get("summary") or hit["text"]}
 
         min_f = int(cfg.extract.min_frames) or None
         max_f = int(cfg.extract.max_frames) or None
-        _plan, frames = af.adaptive_extract(
+        plan, frames = af.adaptive_extract(
             video, runtime / "frames", min_frames=min_f, max_frames=max_f,
             seconds_per_frame=float(cfg.extract.seconds_per_frame),
             max_height=int(cfg.extract.max_height))
@@ -567,11 +644,14 @@ class VideoUnderstandPlugin(MaiBotPlugin):
         transcript = "" if audio.get("skipped") else str(audio.get("text") or "")
 
         return {"cached": False, "frames": frames, "transcript": transcript,
-                "sig": sig, "cache": cache}
+                "sig": sig, "cache": cache,
+                "frame_times": list(getattr(plan, "times", []) or []),
+                "duration": float(getattr(plan, "duration", 0.0) or 0.0)}
 
     # ---- 异步：调用宿主模型 ----
 
-    async def _describe(self, frames: list[Path], transcript: str) -> str:
+    async def _describe(self, frames: list[Path], transcript: str,
+                        frame_times=None, duration: float = None) -> dict[str, Any]:
         cfg = self.config
         mode = str(cfg.vision.mode or "host").strip().lower()
 
@@ -580,14 +660,21 @@ class VideoUnderstandPlugin(MaiBotPlugin):
                 raise RuntimeError("direct 模式未配置 API Key")
             return await asyncio.to_thread(
                 af.describe_video, frames, transcript,
+                frame_times=frame_times, duration=duration,
                 api_key=str(cfg.vision.api_key),
                 url=str(cfg.vision.api_url),
                 model=str(cfg.vision.model),
                 timeout=float(cfg.vision.timeout_s))
 
-        prompt = af.build_vision_prompt(transcript)
+        if frame_times:
+            prompt = af.build_timeline_prompt(frame_times, transcript)
+        else:
+            prompt = af.build_vision_prompt(transcript)
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
-        for frame in frames:
+        for i, frame in enumerate(frames):
+            if frame_times and i < len(frame_times):
+                content.append({"type": "text",
+                                "text": f"[{af.fmt_ts(frame_times[i])}]"})
             b64 = base64.b64encode(Path(frame).read_bytes()).decode("ascii")
             content.append({"type": "image", "image_format": "jpeg",
                             "image_base64": b64})
@@ -604,7 +691,9 @@ class VideoUnderstandPlugin(MaiBotPlugin):
         text = str(text).strip()
         if not text:
             raise RuntimeError("宿主模型返回空描述")
-        return text
+        if frame_times:
+            return af.parse_timeline(text, duration=duration)
+        return {"segments": [], "summary": text, "raw": text, "text": text}
 
     # ---- 工具 ----
 

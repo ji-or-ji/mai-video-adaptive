@@ -665,25 +665,170 @@ def build_vision_prompt(transcript: str = "", max_chars: int = 8000) -> str:
             "只写能从画面中确认的内容，不要推测。")
 
 
-def describe_video(frames, transcript: str = "", *, api_key: str,
-                   url: str = DS_CHAT_URL, model: str = DEFAULT_VISION_MODEL,
-                   timeout: float = 120.0, max_chars: int = 8000) -> str:
-    """把关键帧（可选带语音转录）交给视觉模型，返回描述。"""
-    prompt = build_vision_prompt(transcript, max_chars)
+def fmt_ts(sec: float) -> str:
+    """秒 → mm:ss（超过一小时用 h:mm:ss）。"""
+    s = int(max(0.0, round(float(sec or 0.0))))
+    h, rem = divmod(s, 3600)
+    m, ss = divmod(rem, 60)
+    return f"{h}:{m:02d}:{ss:02d}" if h else f"{m:02d}:{ss:02d}"
+
+
+def build_timeline_prompt(frame_times, transcript: str = "",
+                          max_chars: int = 8000) -> str:
+    """时间轴模式的提问文本：要求按时间分段、只输出 JSON。"""
+    n = len(frame_times)
+    tail = fmt_ts(frame_times[-1]) if n else "00:00"
+    head = (f"这是从一段视频中按时间顺序抽取的 {n} 个关键帧，"
+            f"每张图前面的方括号是它出现的时间点，视频约 {tail}。\n")
+    if transcript:
+        head += "视频里的语音转录：\n" + transcript[:max_chars] + "\n"
+    head += ("\n请按时间顺序分段描述画面内容。只输出 JSON，格式：\n"
+             '{"segments":[{"start":起始秒数,"end":结束秒数,"text":"描述"}]}\n'
+             "规则：每段 80 字以内，描述文字里不要写时间标记；"
+             "start/end 为秒数，按时间递增、首尾相接、不重叠；"
+             "相邻画面相同就并成一段，不要逐帧罗列；"
+             "以画面为主要依据，只写能确认的内容，不推测，不解释判断过程。")
+    return head
+
+
+def _extract_json(text: str):
+    """从模型输出里抠出第一个完整 JSON 对象；失败返回 None。"""
+    s = (text or "").strip()
+    if not s:
+        return None
+    if s.startswith("```"):
+        s = s.strip("`").strip()
+        i = s.find("{")
+        if i >= 0:
+            s = s[i:]
+    cands = [s]
+    if "{" in s and "}" in s:
+        cands.append(s[s.find("{"): s.rfind("}") + 1])
+    for cand in cands:
+        try:
+            return json.loads(cand)
+        except Exception:
+            continue
+    return None
+
+
+def _clean_segments(items, duration=None) -> list:
+    """校验并规整分段：转秒数、排序、去重叠、丢空段。"""
+    out = []
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        txt = str(it.get("text") or it.get("desc") or "").strip()
+        txt = re.sub(r"^\s*[\[【]\d{1,2}:\d{2}(?::\d{2})?[\]】]\s*", "", txt).strip()
+        if not txt:
+            continue
+        try:
+            a = float(it.get("start", 0.0))
+            b = float(it.get("end", a))
+        except Exception:
+            continue
+        if b <= a:
+            b = a + 0.1
+        out.append({"start": max(0.0, a), "end": b, "text": txt})
+    out.sort(key=lambda x: x["start"])
+    fixed = []
+    for seg in out:
+        if fixed and seg["start"] < fixed[-1]["end"]:
+            seg["start"] = fixed[-1]["end"]
+            if seg["end"] <= seg["start"]:
+                continue
+        fixed.append(seg)
+    if duration:
+        for seg in fixed:
+            seg["end"] = min(seg["end"], float(duration))
+    return [s for s in fixed if s["end"] > s["start"]]
+
+
+def condense_segments(segments, granularity: float = None,
+                      seg_chars: int = 40, target_lines: int = 6) -> str:
+    """把详细时间轴压成粗粒度摘要（注入上下文用）。
+
+    granularity 为空时按目标条数反推，避免短视频只压出一两条。
+    """
+    if not segments:
+        return ""
+    if len(segments) <= target_lines:
+        return "\n".join(f"{fmt_ts(s.get('start', 0.0))} "
+                         f"{str(s.get('text', ''))[:seg_chars]}"
+                         for s in segments)
+    if not granularity or granularity <= 0:
+        span = (float(segments[-1].get("end", 0.0))
+                - float(segments[0].get("start", 0.0)))
+        granularity = max(8.0, span / max(1, target_lines))
+    lines, bucket, buf = [], None, []
+
+    def flush():
+        if not buf:
+            return
+        text = " ".join(buf)
+        if len(text) > seg_chars:
+            text = text[:seg_chars - 1] + "…"
+        lines.append(f"{fmt_ts(bucket)} {text}")
+
+    for seg in segments:
+        st = float(seg.get("start", 0.0))
+        if bucket is None or st - bucket >= granularity:
+            flush()
+            bucket, buf = st, []
+        buf.append(str(seg.get("text", "")).strip())
+    flush()
+    return "\n".join(lines)
+
+
+def parse_timeline(text: str, duration=None) -> dict:
+    """解析模型输出为 {segments, summary, raw, text}；非 JSON 时退化为纯文本。"""
+    raw = (text or "").strip()
+    obj = _extract_json(raw)
+    segs = _clean_segments(obj.get("segments") if isinstance(obj, dict) else None,
+                           duration=duration)
+    summary = condense_segments(segs) if segs else raw
+    return {"segments": segs, "summary": summary, "raw": raw, "text": summary}
+
+
+def describe_video(frames, transcript: str = "", *, frame_times=None,
+                   api_key: str, url: str = DS_CHAT_URL,
+                   model: str = DEFAULT_VISION_MODEL, timeout: float = 120.0,
+                   max_chars: int = 8000, duration: float = None) -> dict:
+    """关键帧（可选带语音）交给视觉模型，返回 {segments, summary, raw, text}。
+
+    给了 frame_times 就走时间轴模式（输出分段 JSON），否则退回整体概括。
+    """
+    if frame_times:
+        prompt = build_timeline_prompt(frame_times, transcript, max_chars)
+    else:
+        prompt = build_vision_prompt(transcript, max_chars)
     content = [{"type": "text", "text": prompt}]
-    for f in frames:
+    for i, f in enumerate(frames):
+        if frame_times and i < len(frame_times):
+            content.append({"type": "text", "text": f"[{fmt_ts(frame_times[i])}]"})
         b = base64.b64encode(Path(f).read_bytes()).decode("ascii")
         content.append({"type": "image_url",
                         "image_url": {"url": "data:image/jpeg;base64," + b}})
+    max_tokens = 600 if not frame_times else min(4000, max(800, 140 * len(frames)))
     payload = {"model": model, "messages": [{"role": "user", "content": content}],
-               "max_tokens": 500, "thinking": {"type": "disabled"}}
+               "max_tokens": max_tokens, "thinking": {"type": "disabled"}}
+    if frame_times:
+        payload["response_format"] = {"type": "json_object"}
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json",
                  "Authorization": "Bearer " + api_key})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         body = json.loads(r.read().decode("utf-8"))
-    return str((body.get("choices") or [{}])[0].get("message", {}).get("content") or "")
+    usage = body.get("usage") or {}
+    text = str((body.get("choices") or [{}])[0].get("message", {}).get("content") or "")
+    if frame_times:
+        out = parse_timeline(text, duration=duration)
+    else:
+        stripped = text.strip()
+        out = {"segments": [], "summary": stripped, "raw": text, "text": stripped}
+    out["usage"] = usage
+    return out
 
 
 def understand_video(video: Path, *, out_dir: Path, asr_mode: str = ASR_MODE_OFF,
@@ -719,13 +864,21 @@ def understand_video(video: Path, *, out_dir: Path, asr_mode: str = ASR_MODE_OFF
                              api_key=api_key, local_model=local_model,
                              local_tokens=local_tokens)
     transcript = "" if audio.get("skipped") else audio.get("text", "")
-    desc = describe_video(frames, transcript, api_key=vision_api_key,
-                          url=vision_url, model=vision_model, timeout=vision_timeout)
+    result = describe_video(frames, transcript, frame_times=plan.times,
+                            api_key=vision_api_key, url=vision_url,
+                            model=vision_model, timeout=vision_timeout,
+                            duration=plan.duration)
+    desc = result["text"]
     if cache is not None and sig is not None and desc:
-        cache.remember(sig, desc, video.name)
+        cache.remember(sig, desc, video.name,
+                       segments=result.get("segments"),
+                       summary=result.get("summary"))
     return {"cached": False, "frames": len(frames), "novelty": plan.novelty,
             "frame_count": plan.frame_count, "transcript": transcript,
-            "description": desc, "elapsed": time.time() - t0}
+            "description": desc, "segments": result.get("segments") or [],
+            "summary": result.get("summary") or desc,
+            "raw": result.get("raw", desc), "usage": result.get("usage") or {},
+            "elapsed": time.time() - t0}
 
 
 # ---------------- 签名缓存（相似视频复用描述） ----------------
@@ -781,20 +934,28 @@ class VideoSignatureCache:
         return hit / len(sig_a)
 
     def lookup(self, sig):
-        """命中则返回 dict（含 text / similarity），否则 None。"""
+        """命中则返回 dict（含 text / segments / summary），否则 None。"""
         best, best_sim = None, 0.0
         for e in self.entries:
             sim = self._ratio(sig, e.get("sig") or [])
             if sim > best_sim:
                 best, best_sim = e, sim
         if best is not None and best_sim >= self.match_threshold:
-            return {"text": best.get("text", ""), "similarity": best_sim,
+            return {"text": best.get("text", ""),
+                    "segments": best.get("segments") or [],
+                    "summary": best.get("summary") or best.get("text", ""),
+                    "similarity": best_sim,
                     "source": best.get("source", "")}
         return None
 
-    def remember(self, sig, text: str, source: str = ""):
-        self.entries.append({"sig": sig, "text": text, "source": source,
-                             "ts": time.time()})
+    def remember(self, sig, text: str, source: str = "",
+                 segments=None, summary: str = ""):
+        entry = {"sig": sig, "text": text, "source": source, "ts": time.time()}
+        if segments:
+            entry["segments"] = segments
+        if summary:
+            entry["summary"] = summary
+        self.entries.append(entry)
         if len(self.entries) > self.max_entries:
             self.entries = self.entries[-self.max_entries:]
         self._save()
