@@ -6,9 +6,66 @@ import fs from "fs";
 import path from "path";
 import https from "https";
 import http from "http";
+import dns from "dns";
 
 let logger = null;
 const tag = "[video-fetch]";
+
+// ---- 下载目标安全校验（防 SSRF）----
+// 事件里的 data.url 可能受消息内容影响，不能只要 http/https 就下。
+// 两道：域名必须在 QQ 媒体白名单内；解析后的 IP 不得是内网/元数据地址。
+const ALLOWED_HOST_SUFFIX = [
+    ".qq.com", ".qq.com.cn", ".gtimg.com", ".qpic.cn", ".tencent.com",
+];
+
+const MAX_BYTES = 500 * 1024 * 1024;
+
+const hostAllowed = (host) => {
+    const h = String(host || "").toLowerCase();
+    if (!h) return false;
+    return ALLOWED_HOST_SUFFIX.some((s) => h === s.slice(1) || h.endsWith(s));
+};
+
+const ipIsPrivate = (ip) => {
+    const v = String(ip || "").toLowerCase();
+    if (!v) return true;
+    if (v.includes(":")) {
+        return v === "::1" || v === "::" ||
+            v.startsWith("fe80") || v.startsWith("fc") || v.startsWith("fd");
+    }
+    const p = v.split(".").map(Number);
+    if (p.length !== 4 || p.some((n) => !Number.isInteger(n))) return true;
+    const [a, b] = p;
+    if (a === 0 || a === 10 || a === 127) return true;
+    if (a === 169 && b === 254) return true;          // link-local / 云元数据
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+    if (a >= 224) return true;                        // 组播/保留
+    return false;
+};
+
+const assertSafeUrl = async (rawUrl) => {
+    let u;
+    try {
+        u = new URL(String(rawUrl));
+    } catch (_) {
+        throw new Error("url 解析失败");
+    }
+    if (u.protocol !== "https:" && u.protocol !== "http:") {
+        throw new Error(`非 http(s) 协议: ${u.protocol}`);
+    }
+    if (!hostAllowed(u.hostname)) {
+        throw new Error(`域名不在白名单: ${u.hostname}`);
+    }
+    const addrs = await dns.promises.lookup(u.hostname, { all: true });
+    for (const a of addrs) {
+        if (ipIsPrivate(a.address)) {
+            throw new Error(`解析到内网地址: ${a.address}`);
+        }
+    }
+    return u;
+};
 
 const writeJson = (p, obj) => {
     try {
@@ -27,8 +84,21 @@ const download = (url, dest) => new Promise((resolve, reject) => {
             reject(new Error(`HTTP ${res.statusCode}`));
             return;
         }
+        const declared = Number(res.headers["content-length"] || 0);
+        if (declared && declared > MAX_BYTES) {
+            res.resume();
+            reject(new Error(`内容过大: ${declared} bytes`));
+            return;
+        }
         fs.mkdirSync(path.dirname(dest), { recursive: true });
         const ws = fs.createWriteStream(dest);
+        let written = 0;
+        res.on("data", (chunk) => {
+            written += chunk.length;
+            if (written > MAX_BYTES) {
+                req.destroy(new Error(`内容过大: 超过 ${MAX_BYTES} bytes`));
+            }
+        });
         res.pipe(ws);
         ws.on("finish", () => {
             try { resolve(fs.statSync(dest).size); } catch (e) { reject(e); }
@@ -57,6 +127,18 @@ const handleVideo = async (ctx, seg, event) => {
     const dir = path.join(ctx.dataPath || ".", "videos");
     const record = path.join(dir, "latest.json");
     const dest = path.join(dir, path.basename(name));
+
+    // 安全校验：非白名单域名 / 解析到内网 / 非 http(s)，一律拒绝下载
+    try {
+        await assertSafeUrl(url);
+    } catch (e) {
+        logger?.error(`${tag} 拒绝下载（安全校验）: ${e && e.message} url=${String(url).slice(0, 120)}`);
+        writeJson(record, {
+            phase: "rejected", url, file: path.basename(name),
+            reason: String(e && e.message), ts: Date.now()
+        });
+        return;
+    }
 
     writeJson(record, {
         phase: "downloading", url, file: path.basename(name),

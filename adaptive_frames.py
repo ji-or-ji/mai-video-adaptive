@@ -665,7 +665,12 @@ def load_local_recognizer(model: Path, tokens: Path, num_threads: int = 2):
     key = (str(model), str(tokens), num_threads)
     rec = _LOCAL_ASR_CACHE.get(key)
     if rec is None:
-        import sherpa_onnx
+        try:
+            import sherpa_onnx  # noqa: PLC0415
+        except ImportError as exc:
+            raise RuntimeError(
+                "本地音频模式需要额外依赖：pip install sherpa-onnx "
+                "（不想装就改用 audio.mode = api 或 off）") from exc
         rec = sherpa_onnx.OfflineRecognizer.from_sense_voice(
             model=str(model), tokens=str(tokens), num_threads=num_threads,
             use_itn=True, language="auto", debug=False)
