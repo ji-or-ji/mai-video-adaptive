@@ -835,6 +835,58 @@ def condense_segments(segments, granularity: float = None,
     return "\n".join(lines)
 
 
+def merge_tracks(visual, audio, target_lines: int = 6,
+                 seg_chars: int = 40) -> str:
+    """把视觉与音频两条轨道合成一条时间轴摘要（注入上下文用）。
+
+    总预算不变：仍是最多 target_lines 行、每行不超过 seg_chars 字。
+    两条轨道共享这个预算，不是各占一份。
+
+    只有一边有内容时，独占整行额度；两边都有就各分一半，
+    因为声画齐全那一段的信息本来就该平摊。
+    """
+    items: list[dict] = []
+    for s in (visual or []):
+        items.append({"start": float(s.get("start", 0.0)),
+                      "end": float(s.get("end", 0.0)),
+                      "kind": "画面", "text": str(s.get("text") or "").strip()})
+    for s in (audio or []):
+        items.append({"start": float(s.get("start", 0.0)),
+                      "end": float(s.get("end", 0.0)),
+                      "kind": "语音", "text": str(s.get("text") or "").strip()})
+    items = [x for x in items if x["text"]]
+    if not items:
+        return ""
+    items.sort(key=lambda x: x["start"])
+
+    if len(items) <= target_lines:
+        buckets = [[x] for x in items]
+    else:
+        span = max(1e-6, items[-1]["end"] - items[0]["start"])
+        step = span / target_lines
+        buckets = [[] for _ in range(target_lines)]
+        for x in items:
+            i = min(target_lines - 1, int((x["start"] - items[0]["start"]) / step))
+            buckets[i].append(x)
+
+    lines: list[str] = []
+    for bucket in buckets:
+        if not bucket:
+            continue
+        vis = [x for x in bucket if x["kind"] == "画面"]
+        aud = [x for x in bucket if x["kind"] == "语音"]
+        if vis and aud:
+            half = max(8, seg_chars // 2)
+            parts = ["画面：" + vis[0]["text"][:half],
+                     "语音：" + aud[0]["text"][:half]]
+        elif vis:
+            parts = ["画面：" + vis[0]["text"][:seg_chars]]
+        else:
+            parts = ["语音：" + aud[0]["text"][:seg_chars]]
+        lines.append(f"{fmt_ts(bucket[0]['start'])} " + " / ".join(parts))
+    return "\n".join(lines)
+
+
 def parse_timeline(text: str, duration=None) -> dict:
     """解析模型输出为 {segments, summary, raw, text}；非 JSON 时退化为纯文本。"""
     raw = (text or "").strip()
@@ -924,15 +976,16 @@ def understand_video(video: Path, *, out_dir: Path, asr_mode: str = ASR_MODE_OFF
                             api_key=vision_api_key, url=vision_url,
                             model=vision_model, timeout=vision_timeout,
                             duration=plan.duration)
+    vsegs = result.get("segments") or []
+    summary = merge_tracks(vsegs, audio_segments)
     desc = result["text"]
     if cache is not None and sig is not None and desc:
         cache.remember(sig, desc, video.name,
-                       segments=result.get("segments"),
-                       summary=result.get("summary"))
+                       segments=vsegs, summary=summary)
     return {"cached": False, "frames": len(frames), "novelty": plan.novelty,
             "frame_count": plan.frame_count, "transcript": transcript,
-            "description": desc, "segments": result.get("segments") or [],
-            "summary": result.get("summary") or desc,
+            "description": desc, "segments": vsegs,
+            "summary": summary or desc,
             "raw": result.get("raw", desc), "usage": result.get("usage") or {},
             "audio_segments": audio_segments,
             "elapsed": time.time() - t0}
