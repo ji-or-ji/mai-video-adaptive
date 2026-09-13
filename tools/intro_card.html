@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>麦麦假装看视频</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    width: 760px;
+    background: #F5EFE4;
+    color: #2A2622;
+    font-family: "Noto Serif SC", "Source Han Serif SC", "Songti SC", "SimSun", serif;
+    padding: 30px 34px 26px;
+  }
+  .title { font-size: 32px; font-weight: 600; letter-spacing: 1px; }
+  .sub { font-size: 15px; color: #6B6158; margin-top: 8px; }
+  .lead {
+    background: rgba(83,125,150,0.08);
+    border-left: 3px solid #537D96;
+    padding: 16px 20px; margin: 22px 0 6px;
+    font-size: 16px; line-height: 1.85; color: #4A433C;
+  }
+  h2 {
+    font-size: 20px; font-weight: 600;
+    border-left: 3px solid #537D96; padding-left: 10px;
+    margin: 30px 0 14px;
+  }
+  .box {
+    background: #FBF7EE; border: 1px solid #D8CFBE; border-radius: 5px;
+    padding: 16px 18px;
+  }
+  .cmp { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .cmp .col { padding: 14px 16px; border-radius: 5px; }
+  .cmp .old { background: #EFE8DB; border: 1px solid #D8CFBE; }
+  .cmp .new { background: rgba(83,125,150,0.10); border: 1px solid #537D96; }
+  .cmp .tag { font-size: 13px; font-weight: 600; color: #6B6158; letter-spacing: 1px; }
+  .cmp .new .tag { color: #3F6179; }
+  .cmp .txt { font-size: 14px; line-height: 1.75; color: #4A433C; margin-top: 8px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .cell { background: #FBF7EE; border: 1px solid #D8CFBE; border-radius: 5px; padding: 14px 16px; }
+  .cell .k { font-size: 16px; font-weight: 600; }
+  .cell .v { font-size: 14px; color: #4A433C; margin-top: 6px; line-height: 1.7; }
+  ul { list-style: none; }
+  li { font-size: 15px; line-height: 2.0; color: #4A433C; padding-left: 16px; position: relative; }
+  li::before { content: "·"; position: absolute; left: 4px; color: #537D96; font-weight: 700; }
+  .tech { background: #EFE8DB; border: 1px solid #D8CFBE; border-radius: 5px; padding: 14px 18px; margin-top: 24px; }
+  .tech .label { font-size: 13px; font-weight: 600; color: #6B6158; margin-bottom: 8px; letter-spacing: 1px; }
+  .tech li { font-size: 13.5px; line-height: 1.85; }
+  .foot { margin-top: 22px; padding-top: 12px; border-top: 1px solid #D8CFBE; font-size: 13px; color: #6B6158; }
+</style>
+</head>
+<body>
+  <div class="title">麦麦假装看视频</div>
+  <div class="sub">群里发的视频，它现在真的能看懂了</div>
+
+  <div class="lead">
+    之前你发视频，它只能看到一张封面图，所以说不出里面是什么。<br>
+    现在它会自己把视频看完，然后知道画面里发生了什么、谁说了什么。
+  </div>
+
+  <h2>它和别人不一样的地方</h2>
+  <div class="cmp">
+    <div class="col old">
+      <div class="tag">常见的做法</div>
+      <div class="txt">每隔几秒截一张图，不管画面里在演什么。一小时的视频，截到的大多是重复画面。</div>
+    </div>
+    <div class="col new">
+      <div class="tag">它的做法</div>
+      <div class="txt">先看画面变化有多剧烈——变得快的地方多看几眼，几乎不动的地方一眼带过。帧数跟着内容走，不跟着时钟走。</div>
+    </div>
+  </div>
+
+  <h2>这个差别带来什么</h2>
+  <div class="grid">
+    <div class="cell">
+      <div class="k">看得准</div>
+      <div class="v">重点画面不会被漏掉，因为变化大的地方它抽得更密</div>
+    </div>
+    <div class="cell">
+      <div class="k">省得快</div>
+      <div class="v">没内容的画面不浪费帧，一条视频约一分钱</div>
+    </div>
+    <div class="cell">
+      <div class="k">不重复</div>
+      <div class="v">同一条视频再被转发，它秒回，不用重看一遍</div>
+    </div>
+    <div class="cell">
+      <div class="k">不卡聊天</div>
+      <div class="v">在后台默默处理，群里该怎么聊还怎么聊</div>
+    </div>
+  </div>
+
+  <h2>怎么用</h2>
+  <ul>
+    <li>直接发就行。不用 @ 它，也不用记什么命令</li>
+    <li>想知道内容的时候，像平时聊天那样问它一句就好</li>
+  </ul>
+
+  <h2>几点说明</h2>
+  <ul>
+    <li>它只是自己知道视频讲什么，不会主动来插话</li>
+    <li>长视频会自己取舍，不会硬看每一帧</li>
+    <li>看完就把视频删掉了，不留占用</li>
+  </ul>
+
+  <div class="tech">
+    <div class="label">技术注脚</div>
+    <ul>
+      <li>帧数由画面复杂度算出：用编码码率作为信息密度代理，再按累积分布撒点，密处密、疏处疏</li>
+      <li>同一条视频按帧指纹签名去重，命中即复用描述，不重复调用模型</li>
+      <li>音频可选三档：不读 / 本地模型 / 云端接口，默认不读</li>
+      <li>描述注入放在上下文末尾，不破坏 prompt 前缀缓存</li>
+    </ul>
+  </div>
+
+  <div class="foot">由社区插件提供 · 名称为「麦麦假装看视频」</div>
+</body>
+</html>

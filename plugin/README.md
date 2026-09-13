@@ -12,7 +12,7 @@
 QQ 收到群视频**不会下载原片**，只存一张封面缩略图（实测 181 个视频，服务器上一个 mp4 都没有）。
 而 napcat-adapter 又会把视频段压成纯文本，把下载地址丢掉。所以光靠 OneBot 接口拿不到视频。
 
-本项目自带一个 NapCat 插件（`napcat-plugin/video-probe/`）解决这件事：
+本项目自带一个 NapCat 插件（`napcat-plugin/video-fetch/`）解决这件事：
 
 - 监听视频消息，从**原始事件**里拿到真实 CDN 地址（`multimedia.nt.qq.com.cn/...&rkey=...`）
 - 用 `https` 模块下载到本地（实测 `fetch` 在该环境报 `fetch failed`，`https` 稳定）
@@ -20,8 +20,8 @@ QQ 收到群视频**不会下载原片**，只存一张封面缩略图（实测 
 
 **安装步骤（缺一不可）**：
 
-1. 把 `napcat-plugin/video-probe/` 整个目录放进麦麦的 `napcat/plugins/` 下
-2. 在 `napcat/config/plugins.json` 写入 `{"video-probe": true}`
+1. 把 `napcat-plugin/video-fetch/` 整个目录放进麦麦的 `napcat/plugins/` 下
+2. 在 `napcat/config/plugins.json` 写入 `{"video-fetch": true}`
    —— NapCat 除内置插件外**默认禁用**，不写这个文件就不会加载
 3. **重启 NapCat**（会短暂影响 QQ 在线，建议挑冷清时段）
 4. 本插件配置 `napcat.fetch_dir` 填上那个下载目录的绝对路径
