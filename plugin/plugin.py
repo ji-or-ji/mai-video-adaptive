@@ -243,6 +243,7 @@ class VideoUnderstandPlugin(MaiBotPlugin):
                     self.ctx.logger.info("清理过期原片 %d 个", n)
             except Exception:  # noqa: BLE001
                 pass
+        await self._sync_read_video_state()
         import shutil as _sh
         self.ctx.logger.info(
             "视频理解插件已加载 extract=%s/s audio=%s cache=%s ffmpeg=%s",
@@ -260,6 +261,22 @@ class VideoUnderstandPlugin(MaiBotPlugin):
                                version: str) -> None:
         del scope, config_data, version
         self._sem = asyncio.Semaphore(max(1, int(self.config.source.concurrency)))
+        await self._sync_read_video_state()
+
+    async def _sync_read_video_state(self) -> None:
+        """按当前配置热切换 read_video 的启用态。
+
+        宿主侧只翻内存态，重启后以 get_components 的声明为准，两者互补。
+        """
+        comp = getattr(self.ctx, "component", None)
+        if comp is None:
+            return
+        fn = (comp.enable_component if bool(self.config.timeline.keep_video)
+              else comp.disable_component)
+        try:
+            await fn("read_video", "tool")
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.logger.warning("切换 read_video 启用态失败：%s", exc)
 
     # ---- Hook：检测入站视频 ----
 
@@ -467,6 +484,29 @@ class VideoUnderstandPlugin(MaiBotPlugin):
             result = (result.get("response") or result.get("content")
                       or result.get("text") or "")
         return str(result or "").strip()
+
+    def get_components(self) -> list[dict[str, Any]]:
+        """声明组件启用态。
+
+        未开「保留原片」时，把 read_video 置为禁用态：它不暴露给 planner，
+        模型看不到也就不会白调。
+
+        不直接剔除的原因（与社区插件一致）：组件不进注册表时，运行期再
+        启用会因「未找到组件」失败；保留注册、只改启用态才可热切换。
+        """
+        components = super().get_components()
+        try:
+            keep = bool(self.config.timeline.keep_video)
+        except Exception:  # noqa: BLE001  配置尚未注入时按默认（关）处理
+            keep = False
+        if keep:
+            return components
+        for comp in components:
+            if comp.get("name") == "read_video":
+                meta = comp.get("metadata")
+                if isinstance(meta, dict):
+                    meta["enabled"] = False
+        return components
 
     @Tool(
         "read_video",
