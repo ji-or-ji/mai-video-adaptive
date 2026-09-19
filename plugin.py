@@ -366,9 +366,15 @@ class VideoUnderstandPlugin(MaiBotPlugin):
 
         sid = str(kwargs.get("session_id") or kwargs.get("stream_id") or "").strip()
         record = self._session_latest.get(sid) if sid else None
-        if record is None and self._session_latest:
-            record = max(self._session_latest.values(), key=lambda x: float(x.get("ts") or 0.0))
-        if not record or not str(record.get("text") or "").strip():
+        # 严格按会话匹配，绝不跨会话兜底：
+        # 一旦拿本会话记录去填别的会话（群 A 的视频注进群 B/私聊），就是串台。
+        if not record:
+            return None
+        # 陈旧记录不再注入（30 分钟），避免会话 id 被复用时带出旧内容
+        if time.time() - float(record.get("ts") or 0.0) > 1800:
+            self._session_latest.pop(sid, None)
+            return None
+        if not str(record.get("text") or "").strip():
             return None
 
         text = str(record["text"]).strip()
@@ -408,6 +414,15 @@ class VideoUnderstandPlugin(MaiBotPlugin):
         self.ctx.logger.info("已注入视频内容（末尾，schema=%s）：%s",
                              new_kwargs.get("item_schema_version"), block[:120])
         return {"action": "continue", "modified_kwargs": new_kwargs}
+
+    def _trim_session_latest(self, keep: int = 50) -> None:
+        """会话记录条数上限，超出按时间淘汰，避免长期运行内存增长。"""
+        if len(self._session_latest) <= keep:
+            return
+        order = sorted(self._session_latest.items(),
+                       key=lambda kv: float(kv[1].get("ts") or 0.0))
+        for sid, _ in order[:len(self._session_latest) - keep]:
+            self._session_latest.pop(sid, None)
 
     def _remember(self, desc: dict[str, Any], prep: dict[str, Any],
                   stream_id: str, group_id: str = "",
@@ -607,6 +622,7 @@ class VideoUnderstandPlugin(MaiBotPlugin):
                     "text": text, "ts": time.time(), "key": key,
                     "segments": desc.get("segments") or [],
                     "summary": desc.get("summary") or text}
+                self._trim_session_latest()
                 self.ctx.logger.info("视频理解完成 name=%s text=%s",
                                      asset.name or asset.file_ref, text[:80])
             except Exception as exc:  # noqa: BLE001
