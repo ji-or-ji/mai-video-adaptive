@@ -45,13 +45,14 @@ class TimelineStore:
 
     def save(self, key: str, *, segments, summary: str, duration: float = 0.0,
              group_id: str = "", message_id: str = "", video_kept: bool = False,
-             now: float | None = None) -> dict:
+             file_name: str = "", now: float | None = None) -> dict:
         now = time.time() if now is None else now
         self.root.mkdir(parents=True, exist_ok=True)
         record = {"key": key, "duration": float(duration or 0.0),
                   "created_at": now, "segments": segments or [],
                   "group_id": str(group_id or ""),
                   "message_id": str(message_id or ""),
+                  "file_name": str(file_name or ""),
                   "video_kept": bool(video_kept)}
         (self.root / f"{key}.json").write_text(
             json.dumps(record, ensure_ascii=False), encoding="utf-8")
@@ -59,6 +60,7 @@ class TimelineStore:
         idx = self._load_index()
         idx[key] = {"group_id": record["group_id"],
                     "message_id": record["message_id"],
+                    "file_name": record["file_name"],
                     "created_at": now,
                     "duration": record["duration"],
                     "summary": summary or "",
@@ -93,6 +95,20 @@ class TimelineStore:
             return None
         for key, meta in self._load_index().items():
             if str(meta.get("message_id") or "") == mid:
+                return key
+        return None
+
+    def by_filename(self, file_name: str) -> str | None:
+        """按视频文件名反查标识。
+
+        用途：cleanup_after 会把原片删掉，同一条视频被转发/引用再来时
+        取回目录已无文件；此时按文件名找回已有时间轴直接复用。
+        """
+        name = str(file_name or "").strip()
+        if not name:
+            return None
+        for key, meta in self._load_index().items():
+            if str(meta.get("file_name") or "") == name:
                 return key
         return None
 

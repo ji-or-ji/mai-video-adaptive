@@ -201,6 +201,11 @@ class TimelineSection(PluginConfigBase):
         json_schema_extra={"label": "保留原片（占磁盘）", "order": 40})
     keep_video_hours: float = Field(default=24.0, description="原片保留小时数",
                                     json_schema_extra={"label": "原片保留（小时）", "order": 50})
+    inject_fresh_seconds: float = Field(
+        default=300.0,
+        description=("视频刚理解完的这段时间内，每条请求都注入摘要；"
+                     "超过后仅在最近消息提到视频时才注入（省 token）"),
+        json_schema_extra={"label": "强制注入时长（秒）", "order": 60})
 
 
 class VideoUnderstandConfig(PluginConfigBase):
@@ -377,10 +382,26 @@ class VideoUnderstandPlugin(MaiBotPlugin):
         if not str(record.get("text") or "").strip():
             return None
 
+        # 相关性闸门：
+        # 实测注入的 item 是「单次请求有效」的——麦麦每次请求都重建 items，
+        # 所以上下文里看不到上次注入的内容，那个 _M_DONE 检查永不命中，
+        # 结果 10 分钟内把同一份摘要重注了 7 次（纯白付 token）。
+        # 因此：刚上传的短窗口内直接注；过窗口后只在最近消息提到视频时才注。
+        fresh_s = float(getattr(self.config.timeline, "inject_fresh_seconds", 300) or 0)
+        age = time.time() - float(record.get("ts") or 0.0)
+        if fresh_s > 0 and age > fresh_s and not self._mentions_video(items):
+            return None
+
         text = str(record["text"]).strip()
         ref = str(record.get("key") or "").strip()
+        # 自报家门：明确告诉模型「这段文字就是你刚看过的视频内容」，
+        # 否则它会当成第三方给的描述，回答「我看不到视频 / 只看到一串描述」。
         if ref:
-            text = f"（视频#{ref}）\n{text}"
+            header = (f"{_M_DONE} 你已经看过这条视频了（编号 #{ref}），"
+                      "以下是它的画面与语音内容，可直接据此回答：")
+        else:
+            header = (f"{_M_DONE} 你已经看过这条视频了，"
+                      "以下是它的画面与语音内容，可直接据此回答：")
 
         # 已在上下文里则不重复注入
         for it in items:
@@ -393,7 +414,7 @@ class VideoUnderstandPlugin(MaiBotPlugin):
         import uuid as _uuid
         from datetime import datetime as _dt
 
-        block = f"{_M_DONE} {text}"
+        block = f"{header}\n{text}"
         item = {
             "item_type": "SystemMessageItem",
             "meta": {
@@ -415,6 +436,27 @@ class VideoUnderstandPlugin(MaiBotPlugin):
                              new_kwargs.get("item_schema_version"), block[:120])
         return {"action": "continue", "modified_kwargs": new_kwargs}
 
+    # 提到视频的较弱信号，宁漏勿错（漏了只是不注，错了会白付 token）
+    _VIDEO_HINTS = ("视频", "录像", "录屏", "这段", "那一段")
+
+    @classmethod
+    def _mentions_video(cls, items: Any, lookback: int = 6) -> bool:
+        """最近几条上下文里是否提到视频。"""
+        if not isinstance(items, list):
+            return False
+        for it in reversed(items[-lookback:]):
+            if not isinstance(it, dict):
+                continue
+            for part in (it.get("parts") or []):
+                if not isinstance(part, dict):
+                    continue
+                t = str(part.get("text") or "")
+                if not t or _M_DONE in t:
+                    continue
+                if any(h in t for h in cls._VIDEO_HINTS):
+                    return True
+        return False
+
     def _trim_session_latest(self, keep: int = 50) -> None:
         """会话记录条数上限，超出按时间淘汰，避免长期运行内存增长。"""
         if len(self._session_latest) <= keep:
@@ -426,7 +468,7 @@ class VideoUnderstandPlugin(MaiBotPlugin):
 
     def _remember(self, desc: dict[str, Any], prep: dict[str, Any],
                   stream_id: str, group_id: str = "",
-                  message_id: str = "") -> str:
+                  message_id: str = "", file_name: str = "") -> str:
         """完整时间轴落盘，返回注入上下文用的短标识。
 
         摘要常驻上下文，完整时间轴落盘按需查（见 README 的设计原则）。
@@ -445,6 +487,7 @@ class VideoUnderstandPlugin(MaiBotPlugin):
                        duration=float(prep.get("duration") or 0.0),
                        group_id=group_id or stream_id,
                        message_id=message_id,
+                       file_name=file_name,
                        video_kept=bool(self.config.timeline.keep_video))
             self.ctx.logger.info(
                 "时间轴已落盘 key=%s group=%s msg=%s segs=%d",
@@ -454,6 +497,31 @@ class VideoUnderstandPlugin(MaiBotPlugin):
         except Exception as exc:  # noqa: BLE001
             self.ctx.logger.warning("时间轴落盘失败：%s", exc)
             return ""
+
+    def _reuse_by_filename(self, asset: media_mod.VideoAsset, stream_id: str) -> bool:
+        """原片已被清理时，按文件名找回已有时间轴直接复用。
+
+        cleanup_after 删掉原片后，同一条视频被转发/引用再来会取回失败；
+        此时没必要整条链路白跑，直接复用已理解的结果。
+        """
+        store = self._store
+        if store is None:
+            return False
+        name = str(asset.name or asset.file_ref or "").strip()
+        key = store.by_filename(name)
+        if not key:
+            return False
+        summary = store.summary(key)
+        if not summary:
+            return False
+        rec = store.load(key) or {}
+        self._session_latest[stream_id] = {
+            "text": summary, "ts": time.time(), "key": key,
+            "segments": rec.get("segments") or [], "summary": summary}
+        self._trim_session_latest()
+        self.ctx.logger.info("原片已清理，按文件名复用已有时间轴 key=%s name=%s",
+                             key, name[:60])
+        return True
 
     # ---- ③ 级：保留原片后的按需重读 ----
 
@@ -599,7 +667,14 @@ class VideoUnderstandPlugin(MaiBotPlugin):
         key = ""
         async with self._sem:
             try:
-                video_path = await self._materialize(asset)
+                try:
+                    video_path = await self._materialize(asset)
+                except FileNotFoundError:
+                    # 原片已被 cleanup_after 清掉（同一条视频被转发/引用再来）：
+                    # 按文件名找回已有时间轴直接复用，不让整条链路白跑。
+                    if self._reuse_by_filename(asset, stream_id):
+                        return
+                    raise
                 prep = await asyncio.to_thread(self._prepare, video_path)
                 if prep.get("cached"):
                     desc = {"cached": True,
@@ -617,7 +692,8 @@ class VideoUnderstandPlugin(MaiBotPlugin):
                             segments=desc.get("segments"),
                             summary=desc.get("summary"))
                 text = desc["text"]
-                key = self._remember(desc, prep, stream_id, group_id, message_id)
+                key = self._remember(desc, prep, stream_id, group_id, message_id,
+                                     file_name=name)
                 self._session_latest[stream_id] = {
                     "text": text, "ts": time.time(), "key": key,
                     "segments": desc.get("segments") or [],
