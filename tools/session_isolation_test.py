@@ -277,5 +277,49 @@ with _tf.TemporaryDirectory() as tmp2:
     got, _ = inst7._resolve_kept_video("完全不存在的东西")
     check("不存在的标识返回 None", got is None)
 
+print("\n[12] 取回暂存区按小时清理")
+import os as _os  # noqa: E402
+
+with _tf.TemporaryDirectory() as tmp3:
+    class _Nap:
+        fetch_dir = tmp3
+        fetch_keep_hours = 24.0
+
+    class _Cfg8:
+        napcat = _Nap()
+
+    inst8 = make_plugin()
+    inst8.config = _Cfg8()
+
+    d = Path(tmp3)
+    old_v = d / "old.mp4"
+    old_v.write_bytes(b"x" * 10)
+    new_v = d / "new.mp4"
+    new_v.write_bytes(b"x" * 10)
+    ledger = d / "latest.json"
+    ledger.write_text("{}", encoding="utf-8")
+
+    stale = time.time() - 48 * 3600        # 48 小时前
+    for f in (old_v, ledger):
+        _os.utime(f, (stale, stale))
+
+    n = inst8._purge_fetch_dir()
+    check("删掉了过期文件", not old_v.exists(), f"-> 删除 {n} 个")
+    check("保留未过期文件", new_v.exists())
+    check("保留 latest.json 台账", ledger.exists())
+
+    class _Nap2:
+        fetch_dir = tmp3
+        fetch_keep_hours = 0.0          # 0 = 不限，不应删任何东西
+
+    class _Cfg9:
+        napcat = _Nap2()
+
+    inst9 = make_plugin()
+    inst9.config = _Cfg9()
+    before = len(list(d.iterdir()))
+    inst9._purge_fetch_dir()
+    check("0 表示不限，不做删除", len(list(d.iterdir())) == before)
+
 print(f"\n结果：{ok} 通过 / {fail} 失败")
 sys.exit(1 if fail else 0)
