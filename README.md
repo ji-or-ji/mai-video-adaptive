@@ -135,6 +135,7 @@ keep_video_hours = 24      # 保留时长
 | 时间轴 | ttl_days / max_entries | 7 / 200 | 保留天数与条数上限 |
 | 时间轴 | keep_video | false | 保留原片，解锁 `read_video` 工具（见「重读某段」） |
 | 时间轴 | keep_video_hours | 24 | 原片保留小时数 |
+| 时间轴 | inject_fresh_seconds | 300 | 理解完这段时间内每条请求都注入；超过后仅在提到视频时注入（省 token） |
 | 视觉 | mode | host | host=走主程序任务 / direct=直连接口 |
 | 视觉 | api_url / api_key / model | 空 | direct 模式用（不动主程序 vlm 任务） |
 | 缓存 | enabled / match_threshold | true / 0.9 | 相似视频复用 |
@@ -202,14 +203,17 @@ keep_video_hours = 24      # 保留时长
 
 默认 `cleanup_after = true`：理解完成后立即删除视频本体与中间产物（帧、音轨），
 服务器不会因为跑视频理解而堆文件。描述已存签名缓存，删除不影响重复视频复用。
-若要保留原始视频，把开关关掉即可。
+
+想保留原片（为了「重读某段」）请开 `timeline.keep_video`：它会**只**把原片备份到
+`kept_videos/` 并按小时数自动清理，中间产物照旧清掉。
+不要去关 `cleanup_after`——那样帧和音轨也会一起堆在盘上。
 
 ## 处理流程
 
 ```
 消息到达
  ├─ 识别视频素材（结构化段 / NapCat 文本占位）
- ├─ 写入「理解中」占位
+ ├─ 写入状态标记（[视频解析] 本条内容由插件提供）
  └─ 后台：取视频 → 查签名缓存 → 自适应抽帧 → 可选转录 → 模型理解
       └─ 结果在模型请求前注入上下文（追加在末尾，不破坏 prompt 前缀缓存）
 ```
@@ -218,7 +222,7 @@ keep_video_hours = 24      # 保留时长
 
 - ffmpeg / ffprobe（必须，建议配绝对路径）
 - 主程序：1.0.0+，SDK 2.0.0+
-- **配套 NapCat 插件（本仓库 `napcat-plugin/video-probe`）**
+- **配套 NapCat 插件（本仓库 `napcat-plugin/video-fetch/`）**
 - 可选：sherpa-onnx（本地音频模式）
 
 ## 实测
