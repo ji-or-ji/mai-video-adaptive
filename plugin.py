@@ -571,14 +571,46 @@ class VideoUnderstandPlugin(MaiBotPlugin):
         return af.extract_at(video, times, out,
                              max_height=int(self.config.extract.max_height))
 
+    def _resolve_kept_video(self, ident: str) -> tuple[Path | None, str]:
+        """把模型给的标识解析成原片路径。
+
+        模型眼前有两个标识：消息文本里的文件名（NapCat 适配器写的）和注入里的
+        「编号 #xxx」。它会挑哪个说不准，所以两边都得认：
+          时间轴 key / 文件名 / 文件名去扩展名 / 带 # 的编号
+        """
+        raw = str(ident or "").strip().lstrip("#").strip()
+        if not raw:
+            return None, ""
+        stem = Path(raw).stem
+        # 1) 直接当时间轴 key（保留文件名就是 key）
+        for cand in (raw, stem):
+            p = self._kept_video_path(cand)
+            if p is not None:
+                return p, cand
+        # 2) 当文件名反查时间轴 key
+        store = self._store
+        if store is not None:
+            for cand in (raw, stem, f"{stem}.mp4"):
+                k = store.by_filename(cand)
+                if k:
+                    p = self._kept_video_path(k)
+                    if p is not None:
+                        return p, k
+        # 3) 兜底：在保留目录里按文件名对
+        d = self._kept_dir()
+        if d.is_dir():
+            for f in d.glob("*"):
+                if f.is_file() and (f.name == raw or f.stem == stem):
+                    return f, f.stem
+        return None, raw
+
     async def _read_segment(self, key: str, start: float, end: float) -> str:
         if not bool(self.config.timeline.keep_video):
             return "原片未保留，无法重读片段（可在配置里打开「保留原片」）。"
-        # 模型很可能把注入里的「编号 #xxx」连着井号一起传进来，先归一化
-        key = str(key or "").strip().lstrip("#").strip()
-        video = self._kept_video_path(key) if key else None
+        video, key = self._resolve_kept_video(key)
         if video is None:
-            return f"没找到视频 #{key} 的原片，可能已过期。"
+            return (f"没找到视频 {key or '?'} 的原片，可能已过期。"
+                    "（可以用上下文里的 视频#编号，或视频文件名）")
         s = max(0.0, float(start))
         e = float(end)
         if e <= s:
@@ -641,7 +673,8 @@ class VideoUnderstandPlugin(MaiBotPlugin):
                      "video_id 用上下文里「视频#xxxxxxxx」中的那串标识。"),
         parameters=[
             ToolParameterInfo(name="video_id", param_type=ToolParamType.STRING,
-                              description="视频标识（如 a3f2b1c9d4e5f6a7）",
+                              description=("视频标识：上下文里的 视频#编号，"
+                                           "或视频文件名，两者都可"),
                               required=True),
             ToolParameterInfo(name="start", param_type=ToolParamType.FLOAT,
                               description="起始秒数", required=True),
