@@ -14,7 +14,7 @@
 | 取回群视频原片 | NapCat 插件日志：下载 51MB 原片到 `video-fetch/videos/` |
 | 自适应抽帧 + 视觉理解 | 日志：`帧数=19 耗时=6~26s`，描述含游戏名/地图/界面文字 |
 | 视觉时间轴（带时间戳分段） | 日志：`00:01 一只手捏着两块白色半透明方形果块…` |
-| 时间轴落盘 | `data/plugins/ji-or-ji.video-understanding/timeline/*.json` 实际存在 |
+| 时间轴落盘 | `MaiBot/data/plugins/ji-or-ji.video-understanding/timeline/*.json` 实际存在 |
 | 真实群号 / 消息 id | 日志：`group=1076711748 msg=1100543097` |
 | 重复视频不重复干活 | 同一条视频第二次处理命中缓存 / 按文件名复用 |
 | 组件权限 | `component.enable/disable` 加入 manifest 后，权限警告消失 |
@@ -49,7 +49,7 @@
 - [ ] **合并转发**：用 `ctx.actions.call('get_forward_msg', ...)` 取回内层，递归找视频段（递归已有深度上限 8 + 去重护栏）
 - [ ] 一次真实语音视频的端到端验证（同时覆盖上面四项音频相关）
 - [ ] 确认 `component.enable/disable` 在**配置热改**时也能同步（目前只验证了启动时无警告）
-- [ ] 视需要接入麦麦插件市场的发布流程（参见 `plugin/STORE.md`）
+- [ ] 视需要接入麦麦插件市场的发布流程（参见 `STORE.md`）
 
 ---
 

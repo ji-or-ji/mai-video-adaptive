@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "plugin"))
+sys.path.insert(0, str(ROOT))
 import media as media_mod  # noqa: E402
 
 CASES = [
