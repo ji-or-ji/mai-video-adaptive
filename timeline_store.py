@@ -98,6 +98,18 @@ class TimelineStore:
                 return key
         return None
 
+    def set_message_id(self, key: str, message_id: str) -> None:
+        """补记消息 id（复用已有结果时，新消息也要能按引用反查到）。"""
+        mid = str(message_id or "")
+        if not mid:
+            return
+        idx = self._load_index()
+        meta = idx.get(key)
+        if not isinstance(meta, dict) or str(meta.get("message_id") or "") == mid:
+            return
+        meta["message_id"] = mid
+        self._save_index(idx)
+
     def by_filename(self, file_name: str) -> str | None:
         """按视频文件名反查标识。
 

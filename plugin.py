@@ -498,11 +498,14 @@ class VideoUnderstandPlugin(MaiBotPlugin):
             self.ctx.logger.warning("时间轴落盘失败：%s", exc)
             return ""
 
-    def _reuse_by_filename(self, asset: media_mod.VideoAsset, stream_id: str) -> bool:
-        """原片已被清理时，按文件名找回已有时间轴直接复用。
+    def _reuse_by_filename(self, asset: media_mod.VideoAsset, stream_id: str,
+                           message_id: str = "", why: str = "原片已清理") -> bool:
+        """按文件名找回已有时间轴直接复用。
 
-        cleanup_after 删掉原片后，同一条视频被转发/引用再来会取回失败；
-        此时没必要整条链路白跑，直接复用已理解的结果。
+        两个入口：
+          - 取回前先查（省掉 60 秒的取回等待）
+          - 取回失败后兜底
+        文件名是 QQ 按内容生成的，同一条视频重发名字不变。
         """
         store = self._store
         if store is None:
@@ -515,12 +518,13 @@ class VideoUnderstandPlugin(MaiBotPlugin):
         if not summary:
             return False
         rec = store.load(key) or {}
+        store.set_message_id(key, message_id)
         self._session_latest[stream_id] = {
             "text": summary, "ts": time.time(), "key": key,
             "segments": rec.get("segments") or [], "summary": summary}
         self._trim_session_latest()
-        self.ctx.logger.info("原片已清理，按文件名复用已有时间轴 key=%s name=%s",
-                             key, name[:60])
+        self.ctx.logger.info("%s，按文件名复用已有时间轴 key=%s name=%s",
+                             why, key, name[:60])
         return True
 
     # ---- ③ 级：保留原片后的按需重读 ----
@@ -667,12 +671,16 @@ class VideoUnderstandPlugin(MaiBotPlugin):
         key = ""
         async with self._sem:
             try:
+                # 先按文件名查已有结果：命中就不必等取回（那是 60 秒的等待），
+                # 同一条视频被重发/引用时走的正是这条路。
+                if self._reuse_by_filename(asset, stream_id, message_id,
+                                           why="已有同名时间轴"):
+                    return
                 try:
                     video_path = await self._materialize(asset)
                 except FileNotFoundError:
-                    # 原片已被 cleanup_after 清掉（同一条视频被转发/引用再来）：
-                    # 按文件名找回已有时间轴直接复用，不让整条链路白跑。
-                    if self._reuse_by_filename(asset, stream_id):
+                    # 兜底：上面的按名查没命中，但取回也失败
+                    if self._reuse_by_filename(asset, stream_id, message_id):
                         return
                     raise
                 prep = await asyncio.to_thread(self._prepare, video_path)
