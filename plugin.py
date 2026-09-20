@@ -152,8 +152,9 @@ class NapcatSection(PluginConfigBase):
 
     enabled: bool = Field(default=True, description="用 NapCat HTTP get_file 取回真实视频",
                           json_schema_extra={"label": "启用 NapCat 取回", "order": 10})
-    http_base_url: str = Field(default="http://127.0.0.1:3002",
-                               description="NapCat OneBot HTTP 地址",
+    http_base_url: str = Field(default="http://127.0.0.1:3000",
+                               description=("NapCat OneBot HTTP 地址（默认 3000）；"
+                                            "仅在未配 fetch_dir、走 get_file 回退时用"),
                                json_schema_extra={"label": "HTTP Base URL", "order": 20})
     access_token: str = Field(default="", description="可选 access token",
                               json_schema_extra={"label": "Access Token", "order": 30})
