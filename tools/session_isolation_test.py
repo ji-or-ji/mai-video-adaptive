@@ -181,9 +181,11 @@ with tempfile.TemporaryDirectory() as tmp:
 
     inst5 = make_plugin()
     inst5._store = store
-    ok_reuse = inst5._reuse_by_filename(_Asset(), GROUP_A)
+    ok_reuse = inst5._reuse_by_filename(_Asset(), GROUP_A, "999888")
     check("命中文件名则复用", ok_reuse is True)
     check("复用后会话记录已写入", GROUP_A in inst5._session_latest)
+    check("补记了新消息 id", store.by_message("999888") == "reusekey12345678",
+          f"-> {store.by_message('999888')}")
     out = inject(inst5, GROUP_A)
     check("复用后能正常注入", out is not None and "复用摘要" in out,
           f"-> {str(out)[:40]}")
