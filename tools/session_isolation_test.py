@@ -241,5 +241,42 @@ after_process(inst6, msg)
 check("只标记一次", msg["processed_plain_text"].count(_PENDING_MARK) == 1,
       f"-> {msg['processed_plain_text'].count(_PENDING_MARK)}")
 
+print("\n[11] read_video 的 video_id 归一化（模型常把 # 一起传进来）")
+import tempfile as _tf  # noqa: E402
+
+with _tf.TemporaryDirectory() as tmp2:
+    inst7 = make_plugin()
+    inst7._store = None
+
+    class _TL:
+        keep_video = True
+
+    class _Cfg7:
+        timeline = _TL()
+
+    class _Paths:
+        data_dir = tmp2
+        runtime_dir = str(Path(tmp2) / "rt")
+
+    class _Ctx7:
+        logger = _Logger()
+        paths = _Paths()
+
+    inst7.config = _Cfg7()
+    inst7.ctx = _Ctx7()
+    kdir = Path(tmp2) / "kept_videos"
+    kdir.mkdir()
+    (kdir / "abc123.mp4").write_bytes(b"not-a-real-video")
+
+    res = asyncio.run(P.VideoUnderstandPlugin.handle_read_video(
+        inst7, "#abc123", 1.0, 3.0))
+    txt = str(res.get("content") or "")
+    check("带 # 仍能定位到原片", "没找到视频" not in txt, f"-> {txt[:50]}")
+
+    res2 = asyncio.run(P.VideoUnderstandPlugin.handle_read_video(
+        inst7, "#nope", 1.0, 3.0))
+    txt2 = str(res2.get("content") or "")
+    check("不存在的 key 明确报没找到", "没找到视频" in txt2, f"-> {txt2[:50]}")
+
 print(f"\n结果：{ok} 通过 / {fail} 失败")
 sys.exit(1 if fail else 0)

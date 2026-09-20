@@ -574,7 +574,9 @@ class VideoUnderstandPlugin(MaiBotPlugin):
     async def _read_segment(self, key: str, start: float, end: float) -> str:
         if not bool(self.config.timeline.keep_video):
             return "原片未保留，无法重读片段（可在配置里打开「保留原片」）。"
-        video = self._kept_video_path(key)
+        # 模型很可能把注入里的「编号 #xxx」连着井号一起传进来，先归一化
+        key = str(key or "").strip().lstrip("#").strip()
+        video = self._kept_video_path(key) if key else None
         if video is None:
             return f"没找到视频 #{key} 的原片，可能已过期。"
         s = max(0.0, float(start))
