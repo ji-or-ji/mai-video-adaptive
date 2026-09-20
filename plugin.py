@@ -29,7 +29,7 @@ except ImportError:  # PluginLoader 以文件方式加载
     import timeline_store as tl_store  # type: ignore
 
 
-_M_PENDING = "[视频理解中]"
+_M_PENDING = "[视频解析]"
 _M_DONE = "[视频内容]"
 _M_FAIL = "[视频理解失败]"
 
@@ -324,7 +324,11 @@ class VideoUnderstandPlugin(MaiBotPlugin):
         stream_id = self._stream_id(message)
 
         plain = str(message.get("processed_plain_text") or "").strip()
-        line = f"{_M_PENDING} 检测到 {len(assets)} 个视频，正在理解"
+        # 这句会写进消息文本并永久保留（收到时写的，事后改不了）。
+        # 因此不能写「正在理解」之类带时态的话——否则 bot 的历史里
+        # 永远挂着一条「处理中」，被问到时就说「还没好 / 加载不出来」。
+        # 用中性描述：只说内容由插件提供，不说进度。
+        line = f"{_M_PENDING} 本条视频的内容由解析插件提供"
         if _M_PENDING not in plain and _M_DONE not in plain:
             message["processed_plain_text"] = f"{plain}\n{line}".strip() if plain else line
 

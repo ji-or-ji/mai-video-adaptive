@@ -40,6 +40,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import plugin as P  # noqa: E402
 
+_PENDING_MARK = P._M_PENDING
+
 ok = fail = 0
 
 
@@ -68,6 +70,10 @@ class _Ctx:
 class _Cfg:
     class plugin:
         enabled = True
+
+    class source:
+        auto_process = True
+        max_videos_per_message = 3
 
     class timeline:
         inject_fresh_seconds = 300.0
@@ -195,6 +201,45 @@ with tempfile.TemporaryDirectory() as tmp:
         file_ref = ""
 
     check("未命中则不复用", inst5._reuse_by_filename(_Asset2(), GROUP_A) is False)
+
+def after_process(inst, msg):
+    """跑一次接收钩子（把 _handle 换成空操作，只为看消息文本改成了什么）。"""
+    async def _noop(*_a, **_k):
+        return None
+
+    inst._handle = _noop
+    inst._bg = set()
+    return asyncio.run(
+        P.VideoUnderstandPlugin.on_after_process(inst, msg))
+
+
+def video_msg():
+    return {
+        "raw_message": [{"type": "video",
+                         "data": {"file": "3ac0795f.mp4",
+                                  "url": "https://x/y.mp4", "file_size": 8558780}}],
+        "processed_plain_text": "[视频] 文件: 3ac0795f.mp4，大小: 8558780",
+        "message_info": {"group_info": {"group_id": "1076711748"}},
+        "message_id": "123",
+        "session_id": "sess-1",
+    }
+
+
+print("\n[9] 消息文本里的状态标记：不得带时态（写完就改不了）")
+inst6 = make_plugin()
+msg = video_msg()
+after_process(inst6, msg)
+txt = msg["processed_plain_text"]
+check("标记已写入", _PENDING_MARK in txt, f"-> {txt[-40:]!r}")
+for bad in ("正在", "进行中", "处理中", "稍后"):
+    check(f"不含「{bad}」", bad not in txt, f"-> {txt[-30:]!r}")
+check("标记不得包含 _M_DONE（会永久关掉注入）",
+      P._M_DONE not in txt, f"-> {txt[-30:]!r}")
+
+print("\n[10] 重复处理同一条消息，不叠加标记")
+after_process(inst6, msg)
+check("只标记一次", msg["processed_plain_text"].count(_PENDING_MARK) == 1,
+      f"-> {msg['processed_plain_text'].count(_PENDING_MARK)}")
 
 print(f"\n结果：{ok} 通过 / {fail} 失败")
 sys.exit(1 if fail else 0)
