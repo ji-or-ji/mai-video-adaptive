@@ -164,6 +164,11 @@ class NapcatSection(PluginConfigBase):
         json_schema_extra={"label": "取回目录", "order": 40})
     fetch_wait_s: float = Field(default=60.0, description="等待取回目录出现文件的最长秒数",
                                 json_schema_extra={"label": "等待秒数", "order": 50})
+    fetch_keep_hours: float = Field(
+        default=24.0,
+        description=("取回暂存目录里文件的最长保留小时数，超过即删；"
+                     "暂存区只是中转站，要留的原片由 keep_video 另存（0=不限）"),
+        json_schema_extra={"label": "暂存清理（小时）", "order": 60})
 
 
 class SourceSection(PluginConfigBase):
@@ -237,6 +242,7 @@ class VideoUnderstandPlugin(MaiBotPlugin):
         self._session_latest: dict[str, dict[str, Any]] = {}
         self._bg: set[asyncio.Task[Any]] = set()
         self._store: Any = None
+        self._last_fetch_purge: float = 0.0
 
     # ---- 生命周期 ----
 
@@ -264,6 +270,13 @@ class VideoUnderstandPlugin(MaiBotPlugin):
                     self.ctx.logger.info("清理过期原片 %d 个", n)
             except Exception:  # noqa: BLE001
                 pass
+        # 取回暂存区按小时清理：它只是中转站，不设闸就会只涨不落
+        try:
+            n = self._purge_fetch_dir()
+            if n:
+                self.ctx.logger.info("清理取回暂存区 %d 个过期文件", n)
+        except Exception:  # noqa: BLE001
+            pass
         await self._sync_read_video_state()
         import shutil as _sh
         self.ctx.logger.info(
@@ -534,6 +547,53 @@ class VideoUnderstandPlugin(MaiBotPlugin):
 
     # ---- ③ 级：保留原片后的按需重读 ----
 
+    def _purge_fetch_dir(self) -> int:
+        """清理取回暂存区里的过期文件，返回删除数。
+
+        暂存区只是中转站：要长期留的原片由 keep_video 复制到 kept_videos/，
+        所以这里的东西过期即可删。
+
+        不加这道闸的实测后果：7 天堆到 46 个文件 / 667MB，
+        而整段日志里清理只触发了 18 次（检测到视频 158 次）。
+        漏的原因有好几个（重启抓死任务、合并转发里下了但认不出、文件名对不上），
+        靠堵单个漏点不可靠，按时间清才对所有漏点都成立。
+        """
+        base = str(self.config.napcat.fetch_dir or "").strip()
+        if not base:
+            return 0
+        hours = float(self.config.napcat.fetch_keep_hours or 0)
+        if hours <= 0:
+            return 0
+        d = Path(base)
+        if not d.is_dir():
+            return 0
+        cutoff = time.time() - hours * 3600
+        n = 0
+        for p in d.glob("*"):
+            # latest.json 是取回插件的台账，不能删
+            if not p.is_file() or p.suffix.lower() == ".json":
+                continue
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+                    n += 1
+            except Exception:  # noqa: BLE001
+                pass
+        return n
+
+    def _maybe_purge_fetch(self, min_interval_s: float = 1800.0) -> None:
+        """运行中定期清暂存区（默认半小时最多扫一次，避免每条视频都扫目录）。"""
+        now = time.time()
+        if now - self._last_fetch_purge < min_interval_s:
+            return
+        self._last_fetch_purge = now
+        try:
+            n = self._purge_fetch_dir()
+            if n:
+                self.ctx.logger.info("清理取回暂存区 %d 个过期文件", n)
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.logger.warning("清理取回暂存区失败：%s", exc)
+
     def _kept_dir(self) -> Path:
         return Path(self.ctx.paths.data_dir) / "kept_videos"
 
@@ -757,6 +817,7 @@ class VideoUnderstandPlugin(MaiBotPlugin):
             finally:
                 if bool(self.config.source.cleanup_after):
                     await asyncio.to_thread(self._cleanup, asset, video_path, key)
+                await asyncio.to_thread(self._maybe_purge_fetch)
 
     @staticmethod
     def _safe_child(base: Path, name: str) -> Path | None:

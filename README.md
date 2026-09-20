@@ -141,6 +141,7 @@ keep_video_hours = 24      # 保留时长
 | 缓存 | enabled / match_threshold | true / 0.9 | 相似视频复用 |
 | NapCat | fetch_dir | 空 | **NapCat 取回插件的下载目录** |
 | NapCat | fetch_wait_s | 60 | 等下载完成的最长秒数 |
+| NapCat | fetch_keep_hours | 24 | 取回暂存目录里文件的最长保留小时数（超时即删） |
 | 视频源 | cleanup_after | true | **理解完成后删除视频与中间文件** |
 | 视频源 | max_video_mb / 单条上限 / 并发 | 80 / 3 / 1 | 体积与并发护栏 |
 
@@ -207,6 +208,12 @@ keep_video_hours = 24      # 保留时长
 想保留原片（为了「重读某段」）请开 `timeline.keep_video`：它会**只**把原片备份到
 `kept_videos/` 并按小时数自动清理，中间产物照旧清掉。
 不要去关 `cleanup_after`——那样帧和音轨也会一起堆在盘上。
+
+**NapCat 取回目录另有一套闸。** 那是个中转站，下载下来的文件归 `napcat.fetch_keep_hours`
+管（默认 24 小时，启动时和运行中都会清）。
+为什么不能只依赖 `cleanup_after`：实测 7 天里检测到 158 次视频、清理只触发 18 次，
+中转目录默默堆到 46 个文件 / 667MB。漏的原因不止一个（重启会抓死后台任务、
+合并转发里下了但认不出、文件名对不上），按时间清才对所有漏点都成立。
 
 ## 处理流程
 
