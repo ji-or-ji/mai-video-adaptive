@@ -321,5 +321,25 @@ with _tf.TemporaryDirectory() as tmp3:
     inst9._purge_fetch_dir()
     check("0 表示不限，不做删除", len(list(d.iterdir())) == before)
 
+print("\n[13] 声画双轨合并（插件路径以前漏调这一步）")
+import adaptive_frames as af  # noqa: E402
+
+VIS = [{"start": 0.0, "end": 10.0, "text": "厨房切菜，字幕今日菜谱"},
+       {"start": 10.0, "end": 30.0, "text": "镜头切到户外，白色轿车驶过"}]
+AUD = [{"start": 0.0, "end": 12.0, "text": "首领第一次狂暴的时候要躲柱子后面"}]
+
+both = af.merge_tracks(VIS, AUD)
+check("两边都有时含画面", "画面：" in both, f"-> {both[:30]}")
+check("两边都有时含语音", "语音：" in both, f"-> {both[:30]}")
+
+vis_only = af.merge_tracks(VIS, [])
+check("只有画面时不含语音", "语音：" not in vis_only and "画面：" in vis_only)
+
+len_only = len(af.merge_tracks(VIS, AUD))
+check("合并后仍受预算约束（≤ 6 行）", len(both.strip().splitlines()) <= 6,
+      f"-> {len(both.strip().splitlines())} 行")
+check("合并后体积未明显膨胀", len_only <= 320, f"-> {len_only} 字符")
+check("空输入不报错", af.merge_tracks([], []) == "")
+
 print(f"\n结果：{ok} 通过 / {fail} 失败")
 sys.exit(1 if fail else 0)

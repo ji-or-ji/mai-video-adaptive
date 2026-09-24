@@ -793,6 +793,14 @@ class VideoUnderstandPlugin(MaiBotPlugin):
                     desc = await self._describe(
                         prep["frames"], prep["transcript"],
                         prep.get("frame_times"), prep.get("duration"))
+                    # 声画双轨：把音频轨道并进摘要。
+                    # 漏了这一步的话，语音内容只能经由 prompt 影响模型这一次输出，
+                    # 进不了常驻上下文，之后任何一轮都看不到语气信息。
+                    merged = af.merge_tracks(desc.get("segments") or [],
+                                             prep.get("audio_segments") or [])
+                    if merged:
+                        desc["summary"] = merged
+                        desc["text"] = merged
                     if prep.get("cache") is not None and desc.get("text"):
                         prep["cache"].remember(
                             prep["sig"], desc["text"],
@@ -1088,8 +1096,16 @@ class VideoUnderstandPlugin(MaiBotPlugin):
             gap_s=float(cfg.audio.gap_seconds),
             max_audio_s=float(cfg.audio.max_audio_seconds))
         transcript = "" if audio.get("skipped") else str(audio.get("text") or "")
+        audio_segments = audio.get("segments") or []
+        # 音频链路以前完全没日志：配了 api 却一直失败也不会有人知道。
+        # 把结果打出来，才看得出到底是「没音频」还是「转了但失败」。
+        self.ctx.logger.info(
+            "音频 mode=%s used=%s skipped=%s reason=%s segs=%d chars=%d",
+            mode, audio.get("used") or "-", audio.get("skipped"),
+            audio.get("reason") or "-", len(audio_segments), len(transcript))
 
         return {"cached": False, "frames": frames, "transcript": transcript,
+                "audio_segments": audio_segments,
                 "sig": sig, "cache": cache,
                 "frame_times": list(getattr(plan, "times", []) or []),
                 "duration": float(getattr(plan, "duration", 0.0) or 0.0)}
