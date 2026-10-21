@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """ASR 测试：抽音轨 + 硅基 SenseVoiceSmall 转录"""
+import os
 import sys
 import io
 import time
@@ -14,7 +15,7 @@ ASSETS = ROOT / "assets"
 OUT = ROOT / "out_audio"
 OUT.mkdir(exist_ok=True)
 
-SF_KEY = "***REMOVED***"
+SF_KEY = os.environ.get("SF_KEY", "")
 SF_ASR = "https://api.siliconflow.cn/v1/audio/transcriptions"
 MODEL = "FunAudioLLM/SenseVoiceSmall"
 

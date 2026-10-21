@@ -1,4 +1,5 @@
 """时间轴模式验证：跑一条视频，看模型输出的分段质量与时间戳是否靠谱。"""
+import os
 import sys
 from pathlib import Path
 
@@ -6,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import adaptive_frames as af  # noqa: E402
 
-DS_KEY = "***REMOVED***"
+DS_KEY = os.environ.get("DS_KEY", "")
 OUT = ROOT / "tools" / "_tl_out"
 
 

@@ -5,6 +5,7 @@
 
 用 loop5min.mp4（250 秒）模拟长视频，问它 100~108 秒发生了什么。
 """
+import os
 import json
 import sys
 import time
@@ -15,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import adaptive_frames as af  # noqa: E402
 
-DS_KEY = "***REMOVED***"
+DS_KEY = os.environ.get("DS_KEY", "")
 OUT = ROOT / "tools" / "_reread_out"
 VIDEO = ROOT / "assets" / "loop5min.mp4"
 

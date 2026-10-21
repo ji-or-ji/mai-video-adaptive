@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """音频链路测试：静音分析 + 去静音 + 转录（含超时降级）"""
+import os
 import sys
 import io
 import time
@@ -10,7 +11,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import adaptive_frames as af  # noqa: E402
 
-SF_KEY = "***REMOVED***"
+SF_KEY = os.environ.get("SF_KEY", "")
 ASSETS = ROOT / "assets"
 OUT = ROOT / "out_audio"
 

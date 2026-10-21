@@ -2,6 +2,7 @@
 
 用 summary（实际注入上下文的那份）而非完整 segments，才是真实场景。
 """
+import os
 import json
 import sys
 import urllib.request
@@ -11,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import adaptive_frames as af  # noqa: E402
 
-DS_KEY = "***REMOVED***"
+DS_KEY = os.environ.get("DS_KEY", "")
 URL = "https://api.deepseek.com/chat/completions"
 MODEL = "deepseek-flash"
 OUT = ROOT / "tools" / "_tl_out"

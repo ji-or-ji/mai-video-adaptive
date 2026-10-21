@@ -2,6 +2,7 @@
 
 用同一段视频、同一批帧，只换 prompt，看 usage 差异。
 """
+import os
 import json
 import sys
 import urllib.request
@@ -11,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import adaptive_frames as af  # noqa: E402
 
-DS_KEY = "***REMOVED***"
+DS_KEY = os.environ.get("DS_KEY", "")
 VIDEO = ROOT / "assets" / "video1.mp4"
 OUT = ROOT / "tools" / "_cost_out"
 

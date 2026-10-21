@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """三档模式测试：off / local / api（素材用 TTS 合成的中文讲解视频）"""
+import os
 import sys
 import io
 import subprocess
@@ -11,7 +12,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import adaptive_frames as af  # noqa: E402
 
-SF_KEY = "***REMOVED***"
+SF_KEY = os.environ.get("SF_KEY", "")
 OUT = ROOT / "out_audio"
 MODELS = ROOT / "assets" / "models"
 ASSETS = ROOT / "assets"

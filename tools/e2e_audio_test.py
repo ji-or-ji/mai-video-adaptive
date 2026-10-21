@@ -1,4 +1,5 @@
 """端到端：视觉时间轴 + 音频时间轴同时产出。"""
+import os
 import sys
 from pathlib import Path
 
@@ -6,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import adaptive_frames as af  # noqa: E402
 
-DS_KEY = "***REMOVED***"
+DS_KEY = os.environ.get("DS_KEY", "")
 MODEL = ROOT / "assets" / "models" / "model.int8.onnx"
 TOKENS = ROOT / "assets" / "models" / "tokens.txt"
 OUT = ROOT / "tools" / "_e2e_audio_out"

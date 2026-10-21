@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """端到端测试：自适应抽帧 + 音频转录 → 视觉模型理解"""
+import os
 import sys
 import io
 from pathlib import Path
@@ -9,7 +10,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import adaptive_frames as af  # noqa: E402
 
-DS_KEY = "***REMOVED***"
+DS_KEY = os.environ.get("DS_KEY", "")
 OUT = ROOT / "out_e2e"
 MODELS = ROOT / "assets" / "models"
 

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """端到端 + 签名缓存：重复视频应秒回复用"""
+import os
 import sys
 import io
 from pathlib import Path
@@ -9,7 +10,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import adaptive_frames as af  # noqa: E402
 
-DS_KEY = "***REMOVED***"
+DS_KEY = os.environ.get("DS_KEY", "")
 OUT = ROOT / "out_e2e"
 CACHE = OUT / "e2e_cache.json"
 ASSETS = ROOT / "assets"
